@@ -1,0 +1,40 @@
+# reel-processor configuration
+# Copy this file to config.yaml and fill in your values.
+
+# Path to the project root containing numbered subfolders (1/, 2/, 3/, ...)
+icloud_root: ~/Desktop/progetto RP
+
+# Path where final captioned videos are saved
+output_dir: ~/Library/Mobile Documents/com~apple~CloudDocs/progetto RP/_output
+
+# Global background music file (loops automatically to match video length)
+# Can be mp3, m4a, etc. — independent from per-folder .m4a voiceovers
+background_music: ~/Music/background-track.mp3
+
+# Volume offset for background music relative to voiceover (in dB)
+# -25 means music is 25 dB quieter than the voiceover
+music_volume_db: -25
+
+# Gain applied to the voiceover track (in dB)
+voiceover_gain_db: 0
+
+# Mirage caption template ID — run `python main.py list-templates` to find yours
+caption_template_id: ctpl_YOUR_TEMPLATE_ID_HERE
+
+# Mirage API key from https://platform.mirage.app
+mirage_api_key: your_api_key_here
+
+# Seconds between status polls when waiting for Mirage processing
+poll_interval_seconds: 5
+
+# Maximum number of poll attempts before marking a job as failed
+max_poll_attempts: 20
+
+# Extra seconds added to voiceover duration when trimming video
+video_trim_extra_seconds: 1
+
+# Maximum output file size in MB (warns if exceeded, still attempts upload)
+max_file_size_mb: 50
+
+# Mirage API base URL (change only if using a different environment)
+# mirage_base_url: https://api.mirage.app/v1
