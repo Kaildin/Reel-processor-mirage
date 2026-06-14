@@ -8,6 +8,12 @@ from pathlib import Path
 
 from processor.exceptions import FFmpegError, FFmpegNotFoundError
 
+# HDR10 static metadata (BT.2020 / PQ) for client delivery
+HDR10_MASTER_DISPLAY = (
+    "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
+)
+HDR10_MAX_CLL = "1000,400"
+
 
 def ensure_ffmpeg_installed() -> None:
     for binary in ("ffmpeg", "ffprobe"):
@@ -44,22 +50,121 @@ def get_duration_seconds(media_path: Path) -> float:
         ) from exc
 
 
+def get_video_resolution(video_path: Path) -> tuple[int, int]:
+    ensure_ffmpeg_installed()
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=p=0:s=x",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise FFmpegError(
+            f"ffprobe failed for {video_path}: {exc.stderr.strip()}"
+        ) from exc
+
+    try:
+        width_str, height_str = result.stdout.strip().split("x")
+        return int(width_str), int(height_str)
+    except ValueError as exc:
+        raise FFmpegError(
+            f"Could not parse resolution from ffprobe output: {result.stdout!r}"
+        ) from exc
+
+
 def get_file_size_mb(file_path: Path) -> float:
     return file_path.stat().st_size / (1024 * 1024)
 
 
+def _scale_filter(width: int, height: int) -> str:
+    return (
+        f"scale={width}:{height}:flags=lanczos:"
+        f"force_original_aspect_ratio=increase,"
+        f"crop={width}:{height}"
+    )
+
+
+def _hdr_filter_chain(width: int, height: int) -> str:
+    """SDR → HDR10 tonemap + upscale to target 4K portrait."""
+    scale = _scale_filter(width, height)
+    return (
+        f"{scale},"
+        "zscale=matrix=bt709:transfer=bt709:primaries=bt709,"
+        "zscale=matrix=bt2020:transfer=linear:primaries=bt2020,"
+        "tonemap=tonemap=hable:desat=0,"
+        "zscale=transfer=smpte2084:matrix=bt2020nc:primaries=bt2020:range=tv,"
+        "format=yuv420p10le"
+    )
+
+
+def _sdr_filter_chain(width: int, height: int) -> str:
+    return f"{_scale_filter(width, height)},format=yuv420p"
+
+
+def _video_encode_args(*, enable_hdr: bool, crf: int) -> list[str]:
+    if enable_hdr:
+        x265_params = (
+            f"hdr-opt=1:repeat-headers=1:"
+            f"colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:"
+            f"master-display={HDR10_MASTER_DISPLAY}:max-cll={HDR10_MAX_CLL}"
+        )
+        return [
+            "-c:v",
+            "libx265",
+            "-pix_fmt",
+            "yuv420p10le",
+            "-crf",
+            str(crf),
+            "-preset",
+            "medium",
+            "-tag:v",
+            "hvc1",
+            "-x265-params",
+            x265_params,
+        ]
+    return [
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        str(crf),
+        "-preset",
+        "medium",
+    ]
+
+
+def _run_ffmpeg(cmd: list[str]) -> None:
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise FFmpegError(f"ffmpeg failed:\n{exc.stderr.strip()}") from exc
+
+
 def trim_and_mix(
-    video_path: Path,  # .mov input
-    voiceover_path: Path,  # .m4a input
+    video_path: Path,
+    voiceover_path: Path,
     background_music_path: Path,
     output_path: Path,
     *,
     music_volume_db: float,
     voiceover_gain_db: float,
     trim_extra_seconds: float,
+    output_width: int,
+    output_height: int,
+    enable_hdr: bool,
+    video_crf: int,
 ) -> tuple[Path, list[str]]:
     """
-    Trim video and mix voiceover with looping background music.
+    Trim video, upscale to 4K portrait, mix audio, optionally encode HDR10.
 
     Returns the output path and a list of warning messages.
     """
@@ -80,10 +185,22 @@ def trim_and_mix(
     else:
         output_duration = target_duration
 
+    if enable_hdr:
+        warnings.append(
+            "HDR10 export from SDR source: tonemapped for delivery spec "
+            f"({output_width}x{output_height}). True HDR requires HDR source footage."
+        )
+
+    video_filter = (
+        _hdr_filter_chain(output_width, output_height)
+        if enable_hdr
+        else _sdr_filter_chain(output_width, output_height)
+    )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     filter_complex = (
-        f"[0:v]trim=0:{output_duration},setpts=PTS-STARTPTS[v];"
+        f"[0:v]trim=0:{output_duration},setpts=PTS-STARTPTS,{video_filter}[v];"
         f"[1:a]atrim=0:{output_duration},asetpts=PTS-STARTPTS,"
         f"volume={voiceover_gain_db}dB[vo];"
         f"[2:a]aloop=loop=-1:size=2e+09,atrim=0:{output_duration},"
@@ -108,18 +225,11 @@ def trim_and_mix(
         "[v]",
         "-map",
         "[a]",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-crf",
-        "23",
-        "-preset",
-        "medium",
+        *_video_encode_args(enable_hdr=enable_hdr, crf=video_crf),
         "-c:a",
         "aac",
         "-b:a",
-        "128k",
+        "192k",
         "-movflags",
         "+faststart",
         "-t",
@@ -127,24 +237,75 @@ def trim_and_mix(
         str(output_path),
     ]
 
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
-    except subprocess.CalledProcessError as exc:
-        raise FFmpegError(
-            f"ffmpeg failed:\n{exc.stderr.strip()}"
-        ) from exc
-
+    _run_ffmpeg(cmd)
     return output_path, warnings
 
 
-def check_file_size_warning(
-    file_path: Path, max_size_mb: int
-) -> str | None:
+def finalize_export(
+    input_path: Path,
+    output_path: Path,
+    *,
+    output_width: int,
+    output_height: int,
+    enable_hdr: bool,
+    video_crf: int,
+) -> list[str]:
+    """
+    Re-encode Mirage output to guaranteed 4K portrait (+ HDR10 if enabled).
+
+    Used because Mirage may return a lower-resolution or SDR file.
+    """
+    ensure_ffmpeg_installed()
+    warnings: list[str] = []
+
+    width, height = get_video_resolution(input_path)
+    if width == output_width and height == output_height and not enable_hdr:
+        shutil.copy2(input_path, output_path)
+        return warnings
+
+    if width != output_width or height != output_height:
+        warnings.append(
+            f"Mirage returned {width}x{height}; re-encoding to "
+            f"{output_width}x{output_height} for client delivery."
+        )
+
+    video_filter = (
+        _hdr_filter_chain(output_width, output_height)
+        if enable_hdr
+        else _sdr_filter_chain(output_width, output_height)
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vf",
+        video_filter,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        *_video_encode_args(enable_hdr=enable_hdr, crf=video_crf),
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    _run_ffmpeg(cmd)
+    return warnings
+
+
+def check_file_size_warning(file_path: Path, max_size_mb: int) -> str | None:
     size_mb = get_file_size_mb(file_path)
     if size_mb > max_size_mb:
         return (
-            f"Processed video is {size_mb:.1f} MB (limit: {max_size_mb} MB). "
-            f"Consider re-encoding at a lower bitrate (e.g. -crf 28). "
+            f"Processed video is {size_mb:.1f} MB (Mirage limit: {max_size_mb} MB). "
+            f"Try raising video_crf or mirage_upload_crf in config.yaml. "
             f"Upload will still be attempted."
         )
     return None

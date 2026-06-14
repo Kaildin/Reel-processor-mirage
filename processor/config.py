@@ -24,6 +24,11 @@ class Config:
     max_poll_attempts: int
     video_trim_extra_seconds: float
     max_file_size_mb: int
+    output_width: int
+    output_height: int
+    enable_hdr: bool
+    video_crf: int
+    mirage_upload_crf: int
     mirage_base_url: str = "https://api.mirage.app/v1"
 
     @property
@@ -68,5 +73,10 @@ def load_config(config_path: Path) -> Config:
         max_poll_attempts=int(raw.get("max_poll_attempts", 20)),
         video_trim_extra_seconds=float(raw.get("video_trim_extra_seconds", 1)),
         max_file_size_mb=int(raw.get("max_file_size_mb", 50)),
+        output_width=int(raw.get("output_width", 2160)),
+        output_height=int(raw.get("output_height", 3840)),
+        enable_hdr=bool(raw.get("enable_hdr", True)),
+        video_crf=int(raw.get("video_crf", 22)),
+        mirage_upload_crf=int(raw.get("mirage_upload_crf", 30)),
         mirage_base_url=str(raw.get("mirage_base_url", "https://api.mirage.app/v1")),
     )

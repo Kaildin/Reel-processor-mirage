@@ -33,8 +33,22 @@ max_poll_attempts: 20
 # Extra seconds added to voiceover duration when trimming video
 video_trim_extra_seconds: 1
 
-# Maximum output file size in MB (warns if exceeded, still attempts upload)
+# Maximum output file size in MB for Mirage upload (warns if exceeded)
 max_file_size_mb: 50
+
+# Final export resolution — 4K vertical 9:16 (2160x3840)
+output_width: 2160
+output_height: 3840
+
+# Encode final client delivery as HDR10 (HEVC 10-bit, BT.2020/PQ)
+# Source .mov files are typically SDR; tonemapping is applied for delivery spec.
+enable_hdr: true
+
+# CRF for final client export (lower = higher quality, larger file)
+video_crf: 22
+
+# CRF for Mirage upload intermediate (higher = smaller, helps stay under 50 MB)
+mirage_upload_crf: 30
 
 # Mirage API base URL (change only if using a different environment)
 # mirage_base_url: https://api.mirage.app/v1

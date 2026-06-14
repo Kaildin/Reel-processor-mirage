@@ -40,7 +40,12 @@ Copia `config.yaml.example` in `config.yaml` e compila tutti i campi obbligatori
 | `poll_interval_seconds` | Intervallo tra i poll di stato (default: `5`) |
 | `max_poll_attempts` | Tentativi massimi di poll prima di fallire (default: `20`) |
 | `video_trim_extra_seconds` | Secondi extra oltre la durata del voiceover (default: `1`) |
-| `max_file_size_mb` | Soglia MB per warning dimensione file (default: `50`) |
+| `max_file_size_mb` | Soglia MB per warning upload Mirage (default: `50`) |
+| `output_width` | Larghezza export finale in pixel (default: `2160` = 4K verticale) |
+| `output_height` | Altezza export finale in pixel (default: `3840` = 4K verticale 9:16) |
+| `enable_hdr` | Export finale in HDR10 HEVC 10-bit (default: `true`) |
+| `video_crf` | Qualità export finale — più basso = migliore (default: `22`) |
+| `mirage_upload_crf` | Qualità file inviato a Mirage — più alto = file più piccolo (default: `30`) |
 
 ### Ottenere la Mirage API key
 
@@ -155,11 +160,25 @@ Dopo ogni run viene creato/aggiornato `run_log.json` nella cartella di output co
 
 Status possibili: `success`, `failed`, `skipped`.
 
+## Export 4K + HDR
+
+Il video finale viene esportato in **4K verticale (2160×3840, 9:16)** con **HDR10** (HEVC 10-bit, BT.2020, PQ).
+
+La pipeline ha due passaggi di encoding:
+
+1. **Intermedio per Mirage** — 4K/HDR compresso con `mirage_upload_crf` per restare sotto i 50 MB dell'API
+2. **Export finale per il cliente** — dopo i sottotitoli Mirage, re-encode a 4K/HDR con `video_crf` (qualità superiore, nessun limite 50 MB)
+
+> **Nota:** i file sorgente `.mov` sono tipicamente SDR. L'HDR10 viene applicato tramite tonemapping per rispettare la specifica di consegna. Per HDR nativo servirebbe footage sorgente già in HDR.
+
+Se i file superano i 50 MB in upload, alza `mirage_upload_crf` (es. `32` o `34`) nel `config.yaml`.
+
 ## Pipeline per ogni cartella
 
-1. **FFmpeg** — legge la durata del voiceover, taglia il video a `durata_voiceover + 1s`, mixa voiceover (principale) e musica di sottofondo (loop, -25 dB)
-2. **Mirage API** — upload del video intermedio, poll fino a `COMPLETE`, download del video con sottotitoli
-3. **Salvataggio** — file finale in `_output/`
+1. **FFmpeg** — legge durata voiceover `.m4a`, taglia `.mov`, upscale 4K (2160×3840), mix audio, encode HDR10 per upload Mirage
+2. **Mirage API** — upload intermedio, poll fino a `COMPLETE`, download video con sottotitoli
+3. **Finalizzazione** — re-encode 4K HDR10 per consegna cliente
+4. **Salvataggio** — file finale in `_output/`
 
 Progresso in console:
 

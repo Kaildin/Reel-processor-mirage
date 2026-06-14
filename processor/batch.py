@@ -24,6 +24,7 @@ from processor.exceptions import (
 from processor.ffmpeg_utils import (
     check_file_size_warning,
     ensure_ffmpeg_installed,
+    finalize_export,
     trim_and_mix,
 )
 from processor.mirage_api import MirageClient
@@ -181,6 +182,7 @@ def process_folder(
 
         with tempfile.TemporaryDirectory(prefix="reel-processor-") as tmp_dir:
             intermediate = Path(tmp_dir) / f"{basename}_trimmed.mp4"
+            captioned_raw = Path(tmp_dir) / f"{basename}_captioned_raw.mp4"
 
             state.set_step(PipelineStep.TRIM, "…")
             _print_progress(console, current, total, basename, state)
@@ -193,6 +195,10 @@ def process_folder(
                 music_volume_db=config.music_volume_db,
                 voiceover_gain_db=config.voiceover_gain_db,
                 trim_extra_seconds=config.video_trim_extra_seconds,
+                output_width=config.output_width,
+                output_height=config.output_height,
+                enable_hdr=config.enable_hdr,
+                video_crf=config.mirage_upload_crf,
             )
 
             for warning in trim_warnings:
@@ -220,7 +226,18 @@ def process_folder(
             state.set_step(PipelineStep.COMPLETE, "…")
             _print_progress(console, current, total, basename, state)
 
-            client.download_video(video_id, final_output)
+            client.download_video(video_id, captioned_raw)
+
+            finalize_warnings = finalize_export(
+                captioned_raw,
+                final_output,
+                output_width=config.output_width,
+                output_height=config.output_height,
+                enable_hdr=config.enable_hdr,
+                video_crf=config.video_crf,
+            )
+            for warning in finalize_warnings:
+                console.print(f"  [yellow]⚠ {warning}[/yellow]")
 
             state.set_step(PipelineStep.COMPLETE, "✓")
             _print_progress(console, current, total, basename, state)
