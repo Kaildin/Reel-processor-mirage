@@ -73,12 +73,12 @@ class PipelineState:
         return " | ".join(parts)
 
 
-def output_filename(folder_number: int, basename: str) -> str:
-    return f"{folder_number}_{basename}.mp4"
+def output_filename(video_basename: str) -> str:
+    return f"captions_{video_basename}.mp4"
 
 
-def output_path_for(config: Config, folder_number: int, basename: str) -> Path:
-    return config.output_dir / output_filename(folder_number, basename)
+def output_path_for(config: Config, video_basename: str) -> Path:
+    return config.output_dir / output_filename(video_basename)
 
 
 def load_previous_run_log(log_path: Path) -> list[dict[str, Any]]:
@@ -130,7 +130,7 @@ def process_folder(
     console = console or Console()
     folder_number = scan_result.folder_number
     basename = scan_result.basename or "unknown"
-    final_output = output_path_for(config, folder_number, basename)
+    final_output = output_path_for(config, basename)
     state = PipelineState()
 
     def make_entry(
@@ -296,9 +296,7 @@ def run_batch(
     if only_failed:
         filtered: list[FolderScanResult] = []
         for result in processable:
-            out = output_path_for(
-                config, result.folder_number, result.basename or "unknown"
-            )
+            out = output_path_for(config, result.basename or "unknown")
             if _should_process_only_failed(result.folder_number, out, previous_log):
                 filtered.append(result)
         processable = filtered

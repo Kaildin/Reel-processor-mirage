@@ -78,7 +78,7 @@ Copia l'ID del template desiderato (es. `ctpl_DxflLOnuKkb198FNdI9E`) in `caption
 └── 344/
 ```
 
-Ogni sottocartella numerata deve contenere **esattamente** un file `.mov` (video) e un file `.m4a` (voiceover) con lo stesso basename.
+Ogni sottocartella numerata deve contenere **esattamente** un file `.mov` (video) e un file `.m4a` (voiceover). I nomi non devono coincidere: se c'è una sola coppia nella cartella, viene accettata automaticamente.
 
 ## iCloud e file non scaricati
 
@@ -141,10 +141,10 @@ python main.py list-templates
 I video finali vengono salvati in:
 
 ```
-{output_dir}/{folder_number}_{basename}.mp4
+{output_dir}/captions_{nome_video}.mp4
 ```
 
-Esempio: `42_squat.mp4`
+Esempio: video `squat.mov` → output `captions_squat.mp4`
 
 Dopo ogni run viene creato/aggiornato `run_log.json` nella cartella di output con:
 
@@ -154,7 +154,7 @@ Dopo ogni run viene creato/aggiornato `run_log.json` nella cartella di output co
   "basename": "squat",
   "status": "success",
   "timestamp": "2026-06-11T10:30:00+00:00",
-  "output_path": "/path/to/_output/42_squat.mp4"
+  "output_path": "/path/to/_output/captions_squat.mp4"
 }
 ```
 
@@ -192,7 +192,6 @@ Progresso in console:
 |------|---------------|
 | Coppia mov/m4a mancante | Skip (`missing_pair`) |
 | Più file mov o m4a | Skip (`ambiguous_files`) |
-| Basename diverso | Skip (`name_mismatch`) |
 | File iCloud non scaricato | Skip (`not_downloaded_from_icloud`) |
 | Output già esistente | Skip (usa `--force` per sovrascrivere) |
 | Video più corto del target | Warning, continua |

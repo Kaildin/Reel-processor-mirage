@@ -20,7 +20,6 @@ class ScanStatus(str, Enum):
     OK = "ok"
     MISSING_PAIR = "missing_pair"
     AMBIGUOUS_FILES = "ambiguous_files"
-    NAME_MISMATCH = "name_mismatch"
     NOT_DOWNLOADED = "not_downloaded_from_icloud"
 
 
@@ -102,16 +101,6 @@ def scan_folder(folder_number: int, folder_path: Path) -> FolderScanResult:
                 message=f"Not downloaded from iCloud: {media_path.name}",
             )
 
-    if video_path.stem != audio_path.stem:
-        return FolderScanResult(
-            folder_number=folder_number,
-            status=ScanStatus.NAME_MISMATCH,
-            basename=video_path.stem,
-            video_path=video_path,
-            audio_path=audio_path,
-            message=f"Basename mismatch: {video_path.stem} vs {audio_path.stem}",
-        )
-
     return FolderScanResult(
         folder_number=folder_number,
         status=ScanStatus.OK,
@@ -151,7 +140,6 @@ def print_scan_table(results: list[FolderScanResult], console: Console | None = 
         ScanStatus.OK: "green",
         ScanStatus.MISSING_PAIR: "yellow",
         ScanStatus.AMBIGUOUS_FILES: "red",
-        ScanStatus.NAME_MISMATCH: "red",
         ScanStatus.NOT_DOWNLOADED: "yellow",
     }
 
