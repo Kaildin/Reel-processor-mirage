@@ -93,14 +93,22 @@ def _scale_filter(width: int, height: int) -> str:
 
 
 def _hdr_filter_chain(width: int, height: int) -> str:
-    """SDR → HDR10 tonemap + upscale to target 4K portrait."""
+    """SDR (BT.709) → HDR10 (BT.2020/PQ) upscale to target 4K portrait.
+
+    Correct pipeline:
+      1. Scale to target resolution
+      2. Linearise BT.709 gamma (npl=100 nit reference white for SDR)
+      3. Expand colour primaries to BT.2020
+      4. Apply PQ (SMPTE 2084) transfer curve + set HDR10 metadata
+    Note: tonemap=hable is intentionally absent — it is an HDR→SDR operator
+    and would corrupt colours when applied to an SDR source.
+    """
     scale = _scale_filter(width, height)
     return (
         f"{scale},"
-        "zscale=matrix=bt709:transfer=bt709:primaries=bt709,"
-        "zscale=matrix=bt2020:transfer=linear:primaries=bt2020,"
-        "tonemap=tonemap=hable:desat=0,"
-        "zscale=transfer=smpte2084:matrix=bt2020nc:primaries=bt2020:range=tv,"
+        "zscale=transfer=linear:npl=100,"
+        "zscale=primaries=bt2020,"
+        "zscale=transfer=smpte2084:matrix=bt2020nc:range=tv,"
         "format=yuv420p10le"
     )
 
