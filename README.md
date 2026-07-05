@@ -43,9 +43,9 @@ Copia `config.yaml.example` in `config.yaml` e compila tutti i campi obbligatori
 | `max_file_size_mb` | Soglia MB per warning upload Mirage (default: `50`) |
 | `output_width` | Larghezza export finale in pixel (default: `2160` = 4K verticale) |
 | `output_height` | Altezza export finale in pixel (default: `3840` = 4K verticale 9:16) |
-| `enable_hdr` | Export finale in HDR10 HEVC 10-bit (default: `true`) |
-| `video_crf` | Qualità export finale — più basso = migliore (default: `22`) |
-| `mirage_upload_crf` | Qualità file inviato a Mirage — più alto = file più piccolo (default: `30`) |
+| `enable_hdr` | Export finale in HLG HDR HEVC 10-bit (default: `true`) |
+| `video_crf` | Qualità export finale — più basso = migliore (default: `20`) |
+| `mirage_upload_crf` | Qualità file inviato a Mirage (default: `24`) |
 
 ### Ottenere la Mirage API key
 
@@ -160,24 +160,24 @@ Dopo ogni run viene creato/aggiornato `run_log.json` nella cartella di output co
 
 Status possibili: `success`, `failed`, `skipped`.
 
-## Export 4K + HDR
+## Export 4K + HLG HDR
 
-Il video finale viene esportato in **4K verticale (2160×3840, 9:16)** con **HDR10** (HEVC 10-bit, BT.2020, PQ).
+Il video finale viene esportato in **4K verticale (2160×3840, 9:16)** con **HLG** (HEVC 10-bit, BT.2020, arib-std-b67), allineato al riferimento Mirage Captions.
 
 La pipeline ha due passaggi di encoding:
 
-1. **Intermedio per Mirage** — 4K/HDR compresso con `mirage_upload_crf` per restare sotto i 50 MB dell'API
-2. **Export finale per il cliente** — dopo i sottotitoli Mirage, re-encode a 4K/HDR con `video_crf` (qualità superiore, nessun limite 50 MB)
+1. **Intermedio per Mirage** — 4K/HLG con `mirage_upload_crf` (default `24`)
+2. **Export finale per il cliente** — dopo i sottotitoli Mirage, re-encode a 4K/HLG con `video_crf` (default `20`)
 
-> **Nota:** i file sorgente `.mov` sono tipicamente SDR. L'HDR10 viene applicato tramite tonemapping per rispettare la specifica di consegna. Per HDR nativo servirebbe footage sorgente già in HDR.
+> **Nota:** i file sorgente `.mov` sono tipicamente SDR (BT.709). La conversione a HLG avviene via `zscale` senza `tonemap=hable` (inappropriato per SDR→HDR). Per HDR nativo servirebbe footage sorgente già in HDR.
 
-Se i file superano i 50 MB in upload, alza `mirage_upload_crf` (es. `32` o `34`) nel `config.yaml`.
+Se i file superano il limite upload Mirage, alza `mirage_upload_crf` (es. `28` o `30`) nel `config.yaml`.
 
 ## Pipeline per ogni cartella
 
-1. **FFmpeg** — legge durata voiceover `.m4a`, taglia `.mov`, upscale 4K (2160×3840), mix audio, encode HDR10 per upload Mirage
+1. **FFmpeg** — legge durata voiceover `.m4a`, taglia `.mov`, upscale 4K (2160×3840), mix audio stereo, encode HLG per upload Mirage
 2. **Mirage API** — upload intermedio, poll fino a `COMPLETE`, download video con sottotitoli
-3. **Finalizzazione** — re-encode 4K HDR10 per consegna cliente
+3. **Finalizzazione** — re-encode 4K HLG stereo per consegna cliente
 4. **Salvataggio** — file finale in `_output/`
 
 Progresso in console:

@@ -8,13 +8,6 @@ from pathlib import Path
 
 from processor.exceptions import FFmpegError, FFmpegNotFoundError
 
-# HDR10 static metadata (BT.2020 / PQ) for client delivery
-HDR10_MASTER_DISPLAY = (
-    "G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
-)
-HDR10_MAX_CLL = "1000,400"
-
-
 def ensure_ffmpeg_installed() -> None:
     for binary in ("ffmpeg", "ffprobe"):
         if shutil.which(binary) is None:
@@ -92,23 +85,19 @@ def _scale_filter(width: int, height: int) -> str:
     )
 
 
-def _hdr_filter_chain(width: int, height: int) -> str:
-    """SDR (BT.709) → HDR10 (BT.2020/PQ) upscale to target 4K portrait.
+def _hlg_filter_chain(width: int, height: int) -> str:
+    """SDR (BT.709) → HLG (BT.2020 / arib-std-b67) upscale to target 4K portrait.
 
-    Correct pipeline:
-      1. Scale to target resolution
-      2. Linearise BT.709 gamma (npl=100 nit reference white for SDR)
-      3. Expand colour primaries to BT.2020
-      4. Apply PQ (SMPTE 2084) transfer curve + set HDR10 metadata
-    Note: tonemap=hable is intentionally absent — it is an HDR→SDR operator
-    and would corrupt colours when applied to an SDR source.
+    Matches Mirage Captions reference (HLG, not PQ). No tonemap=hable — that
+    operator is HDR→SDR and would corrupt an SDR→HDR workflow.
     """
     scale = _scale_filter(width, height)
     return (
         f"{scale},"
-        "zscale=transfer=linear:npl=100,"
-        "zscale=primaries=bt2020,"
-        "zscale=transfer=smpte2084:matrix=bt2020nc:range=tv,"
+        "zscale=rangein=full:range=limited:"
+        "primariesin=bt709:primaries=bt2020:"
+        "matrixin=bt709:matrix=bt2020nc:"
+        "transferin=bt709:transfer=arib-std-b67,"
         "format=yuv420p10le"
     )
 
@@ -120,9 +109,11 @@ def _sdr_filter_chain(width: int, height: int) -> str:
 def _video_encode_args(*, enable_hdr: bool, crf: int) -> list[str]:
     if enable_hdr:
         x265_params = (
-            f"hdr-opt=1:repeat-headers=1:"
-            f"colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:"
-            f"master-display={HDR10_MASTER_DISPLAY}:max-cll={HDR10_MAX_CLL}"
+            "repeat-headers=1:"
+            "colorprim=bt2020:"
+            "transfer=arib-std-b67:"
+            "colormatrix=bt2020nc:"
+            "range=limited"
         )
         return [
             "-c:v",
@@ -135,6 +126,16 @@ def _video_encode_args(*, enable_hdr: bool, crf: int) -> list[str]:
             "medium",
             "-tag:v",
             "hvc1",
+            "-color_range",
+            "tv",
+            "-color_primaries",
+            "bt2020",
+            "-color_trc",
+            "arib-std-b67",
+            "-colorspace",
+            "bt2020nc",
+            "-movflags",
+            "+faststart",
             "-x265-params",
             x265_params,
         ]
@@ -147,6 +148,8 @@ def _video_encode_args(*, enable_hdr: bool, crf: int) -> list[str]:
         str(crf),
         "-preset",
         "medium",
+        "-movflags",
+        "+faststart",
     ]
 
 
@@ -172,7 +175,7 @@ def trim_and_mix(
     video_crf: int,
 ) -> tuple[Path, list[str]]:
     """
-    Trim video, upscale to 4K portrait, mix audio, optionally encode HDR10.
+    Trim video, upscale to 4K portrait, mix audio, optionally encode HLG HDR.
 
     Returns the output path and a list of warning messages.
     """
@@ -195,12 +198,12 @@ def trim_and_mix(
 
     if enable_hdr:
         warnings.append(
-            "HDR10 export from SDR source: tonemapped for delivery spec "
-            f"({output_width}x{output_height}). True HDR requires HDR source footage."
+            "HLG export from SDR source (BT.2020 / arib-std-b67) at "
+            f"{output_width}x{output_height}. True HDR requires HDR source footage."
         )
 
     video_filter = (
-        _hdr_filter_chain(output_width, output_height)
+        _hlg_filter_chain(output_width, output_height)
         if enable_hdr
         else _sdr_filter_chain(output_width, output_height)
     )
@@ -238,8 +241,8 @@ def trim_and_mix(
         "aac",
         "-b:a",
         "192k",
-        "-movflags",
-        "+faststart",
+        "-ac",
+        "2",
         "-t",
         str(output_duration),
         str(output_path),
@@ -259,7 +262,7 @@ def finalize_export(
     video_crf: int,
 ) -> list[str]:
     """
-    Re-encode Mirage output to guaranteed 4K portrait (+ HDR10 if enabled).
+    Re-encode Mirage output to guaranteed 4K portrait (+ HLG if enabled).
 
     Used because Mirage may return a lower-resolution or SDR file.
     """
@@ -278,7 +281,7 @@ def finalize_export(
         )
 
     video_filter = (
-        _hdr_filter_chain(output_width, output_height)
+        _hlg_filter_chain(output_width, output_height)
         if enable_hdr
         else _sdr_filter_chain(output_width, output_height)
     )
@@ -300,8 +303,8 @@ def finalize_export(
         "aac",
         "-b:a",
         "192k",
-        "-movflags",
-        "+faststart",
+        "-ac",
+        "2",
         str(output_path),
     ]
     _run_ffmpeg(cmd)

@@ -40,15 +40,15 @@ max_file_size_mb: 50
 output_width: 2160
 output_height: 3840
 
-# Encode final client delivery as HDR10 (HEVC 10-bit, BT.2020/PQ)
-# Source .mov files are typically SDR; tonemapping is applied for delivery spec.
+# Encode final client delivery as HLG HDR (HEVC 10-bit, BT.2020 / arib-std-b67)
+# Source .mov files are typically SDR; zscale converts to HLG for Mirage Captions reference.
 enable_hdr: true
 
 # CRF for final client export (lower = higher quality, larger file)
-video_crf: 22
+video_crf: 20
 
-# CRF for Mirage upload intermediate (higher = smaller, helps stay under 50 MB)
-mirage_upload_crf: 30
+# CRF for Mirage upload intermediate (lower = higher quality; default 24 balances size vs quality)
+mirage_upload_crf: 24
 
 # Mirage API base URL (change only if using a different environment)
 # mirage_base_url: https://api.mirage.app/v1

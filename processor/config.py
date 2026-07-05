@@ -76,7 +76,7 @@ def load_config(config_path: Path) -> Config:
         output_width=int(raw.get("output_width", 2160)),
         output_height=int(raw.get("output_height", 3840)),
         enable_hdr=bool(raw.get("enable_hdr", True)),
-        video_crf=int(raw.get("video_crf", 22)),
-        mirage_upload_crf=int(raw.get("mirage_upload_crf", 30)),
+        video_crf=int(raw.get("video_crf", 20)),
+        mirage_upload_crf=int(raw.get("mirage_upload_crf", 24)),
         mirage_base_url=str(raw.get("mirage_base_url", "https://api.mirage.app/v1")),
     )
