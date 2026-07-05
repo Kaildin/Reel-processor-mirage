@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Optional
+
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+)
 
 from processor.exceptions import FFmpegError, FFmpegNotFoundError
+
 
 def ensure_ffmpeg_installed() -> None:
     for binary in ("ffmpeg", "ffprobe"):
@@ -139,30 +151,7 @@ def _upscale_passthrough_filter_chain(width: int, height: int) -> str:
 
 
 def _hlg_encode_args(crf: int) -> list[str]:
-    """libx265 encode args for HLG 4K delivery.
-
-    Key fixes for iOS HDR badge recognition:
-
-    1. -movflags +write_colr: writes the ISO 'colr' box in the container.
-       iOS/QuickTime reads this box first when deciding whether to show
-       the HDR badge — before inspecting x265 SEI NAL units.
-
-    2. -profile:v main10: explicitly forces HEVC Main10 profile.
-       Without this, libx265 may silently encode as 'Main' even when
-       yuv420p10le is requested. iOS uses the HEVC profile level to
-       gate HDR recognition.
-
-    3. master-display and max-cll are intentionally OMITTED.
-       Those are SMPTE ST 2086 / CEA-861.3 metadata for HDR10
-       (a display-referred format). HLG (ARIB STD-B67) is scene-referred
-       and does not carry absolute luminance metadata. Including HDR10
-       SEI in an HLG stream can cause iOS to misidentify the file as
-       malformed HDR10 and refuse to display the badge.
-
-    The combination of colr box + Main10 profile + arib-std-b67 transfer
-    matches what Apple AVFoundation writes when exporting HLG from Photos
-    or Final Cut Pro X.
-    """
+    """libx265 encode args for HLG 4K delivery."""
     x265_params = (
         "repeat-headers=1:"
         "colorprim=bt2020:"
@@ -197,7 +186,93 @@ def _sdr_encode_args(crf: int) -> list[str]:
     ]
 
 
+def _parse_time_to_seconds(time_str: str) -> float:
+    """Convert HH:MM:SS.ss string from FFmpeg to total seconds."""
+    try:
+        parts = time_str.split(":")
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        elif len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s)
+        return float(time_str)
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def run_ffmpeg_with_progress(
+    cmd: list[str],
+    duration_seconds: float,
+    progress: Progress,
+    task_id: TaskID,
+    label: str = "FFmpeg",
+) -> None:
+    """Run an FFmpeg command while streaming stderr to update a Rich progress bar."""
+    augmented_cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
+
+    try:
+        proc = subprocess.Popen(
+            augmented_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        raise FFmpegError(f"ffmpeg executable not found: {exc}") from exc
+
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    stderr_lines: list[str] = []
+    out_time_s: float = 0.0
+    speed: str = ""
+    fps: str = ""
+
+    for line in proc.stdout:
+        line = line.strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+
+        if key == "out_time":
+            out_time_s = _parse_time_to_seconds(value)
+        elif key == "speed":
+            speed = value
+        elif key == "fps":
+            fps = value
+        elif key == "progress":
+            if duration_seconds > 0:
+                pct = min(out_time_s / duration_seconds, 1.0)
+                completed = int(pct * 100)
+                desc_parts = [label]
+                if fps and fps not in ("0", "0.00", "N/A"):
+                    desc_parts.append(f"{fps}fps")
+                if speed and speed not in ("0x", "N/A"):
+                    desc_parts.append(f"{speed}")
+                progress.update(
+                    task_id,
+                    completed=completed,
+                    description=" ".join(desc_parts),
+                )
+
+    proc.wait()
+
+    for line in proc.stderr:
+        stderr_lines.append(line)
+
+    if proc.returncode != 0:
+        stderr_text = "".join(stderr_lines).strip()
+        raise FFmpegError(f"ffmpeg failed (exit {proc.returncode}):\n{stderr_text}")
+
+    progress.update(task_id, completed=100, description=f"{label} ✓")
+
+
 def _run_ffmpeg(cmd: list[str]) -> None:
+    """Simple blocking FFmpeg run (no progress display)."""
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True)
     except subprocess.CalledProcessError as exc:
@@ -216,6 +291,8 @@ def trim_and_mix(
     output_width: int,
     output_height: int,
     video_crf: int,
+    progress: Optional[Progress] = None,
+    task_id: Optional[TaskID] = None,
 ) -> tuple[Path, list[str]]:
     """
     Prepare the Mirage upload intermediate: trim, scale, mix audio.
@@ -279,7 +356,11 @@ def trim_and_mix(
         str(output_path),
     ]
 
-    _run_ffmpeg(cmd)
+    if progress is not None and task_id is not None:
+        run_ffmpeg_with_progress(cmd, output_duration, progress, task_id, label="TRIM")
+    else:
+        _run_ffmpeg(cmd)
+
     return output_path, warnings
 
 
@@ -291,6 +372,8 @@ def remux_and_upscale(
     output_height: int,
     video_crf: int,
     upscale: bool = True,
+    progress: Optional[Progress] = None,
+    task_id: Optional[TaskID] = None,
 ) -> list[str]:
     """
     Post-Mirage finalization step.
@@ -298,17 +381,12 @@ def remux_and_upscale(
     TEST BRANCH (hlg-passthrough):
     Runs probe_colorspace() first and logs what Mirage returned.
     No zscale conversion - just scale + HLG metadata tags.
-    If the output looks correct: Mirage preserved HLG and this branch
-    is the right approach. If colours are wrong: use main branch.
-
-    Audio is always re-encoded to stereo AAC 192 kbps.
     """
     ensure_ffmpeg_installed()
     warnings: list[str] = []
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Log what Mirage actually returned so we can inspect it
     try:
         cs = probe_colorspace(input_path)
         warnings.append(
@@ -365,7 +443,14 @@ def remux_and_upscale(
             str(output_path),
         ]
 
-    _run_ffmpeg(cmd)
+    duration = get_duration_seconds(input_path) if upscale else 0.0
+    label = "FINALIZE" if upscale else "FINALIZE (remux)"
+
+    if progress is not None and task_id is not None:
+        run_ffmpeg_with_progress(cmd, duration, progress, task_id, label=label)
+    else:
+        _run_ffmpeg(cmd)
+
     return warnings
 
 
