@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -22,6 +23,22 @@ from processor.exceptions import (
 TERMINAL_FAILURE_STATUSES = {"FAILED", "CANCELLED"}
 ACTIVE_STATUSES = {"QUEUED", "PROCESSING", "COMPLETE"}
 
+# HTTP status codes that are transient and worth retrying.
+# 408 = Request Timeout (server closed before we finished sending)
+# 429 = Rate limit
+# 5xx = Server-side errors
+_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+# Timeout tuple: (connect_timeout_seconds, read_timeout_seconds)
+# Upload needs a long read timeout because sending large files takes time.
+_DEFAULT_TIMEOUT = (30, 120)
+_UPLOAD_TIMEOUT = (30, 600)  # up to 10 min for large video uploads
+
+
+def _backoff(attempt: int) -> float:
+    """Exponential backoff with full jitter: sleep [0, 2^attempt] seconds, max 30s."""
+    return random.uniform(0, min(2**attempt, 30))
+
 
 class MirageClient:
     def __init__(self, config: Config) -> None:
@@ -37,6 +54,7 @@ class MirageClient:
         self,
         method: str,
         url: str,
+        timeout: tuple[int, int] = _DEFAULT_TIMEOUT,
         **kwargs: Any,
     ) -> requests.Response:
         max_retries = 3
@@ -44,11 +62,11 @@ class MirageClient:
 
         for attempt in range(max_retries + 1):
             try:
-                response = self._session.request(method, url, timeout=120, **kwargs)
+                response = self._session.request(method, url, timeout=timeout, **kwargs)
             except (RequestsConnectionError, Timeout) as exc:
                 last_error = exc
                 if attempt < max_retries:
-                    time.sleep(2**attempt)
+                    time.sleep(_backoff(attempt))
                     continue
                 raise MirageConnectionError(
                     "Cannot reach Mirage API. Check your internet connection."
@@ -58,9 +76,9 @@ class MirageClient:
                     f"Network error contacting Mirage API: {exc}"
                 ) from exc
 
-            if response.status_code in (429, 500, 502, 503, 504):
+            if response.status_code in _RETRYABLE_STATUS_CODES:
                 if attempt < max_retries:
-                    time.sleep(2**attempt)
+                    time.sleep(_backoff(attempt))
                     continue
                 raise MirageAPIError(
                     f"Mirage API error {response.status_code}: {response.text}",
@@ -76,7 +94,7 @@ class MirageClient:
             return response
 
         raise MirageConnectionError(
-            f"Request failed after retries: {last_error}"
+            f"Request failed after {max_retries} retries: {last_error}"
         )
 
     def upload_for_captions(
@@ -86,9 +104,12 @@ class MirageClient:
     ) -> str:
         """Upload *video_path* and return the Mirage video_id.
 
+        Uses a longer timeout (_UPLOAD_TIMEOUT) so large files don't trigger
+        a 408 before the upload finishes. The 408 is also in the retry list
+        so transient server-side timeouts are automatically recovered.
+
         If *progress_callback* is provided it is called with
-        ``(bytes_sent, total_bytes)`` after each chunk so the caller can
-        drive a Rich progress bar with real byte counts.
+        ``(bytes_sent, total_bytes)`` after each chunk.
         """
         url = self._url("/videos/captions")
         file_size = video_path.stat().st_size
@@ -110,6 +131,7 @@ class MirageClient:
             response = self._request_with_retry(
                 "POST",
                 url,
+                timeout=_UPLOAD_TIMEOUT,
                 data=monitor,
                 headers={"Content-Type": monitor.content_type},
             )
