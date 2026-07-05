@@ -1,5 +1,7 @@
 """Custom exceptions for reel-processor."""
 
+from __future__ import annotations
+
 
 class ReelProcessorError(Exception):
     """Base exception for all reel-processor errors."""
