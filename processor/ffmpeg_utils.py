@@ -77,6 +77,36 @@ def get_file_size_mb(file_path: Path) -> float:
     return file_path.stat().st_size / (1024 * 1024)
 
 
+def probe_colorspace(video_path: Path) -> dict[str, str]:
+    """Return color_transfer, color_primaries, color_space from ffprobe.
+
+    Used to inspect what Mirage actually returns so we can decide
+    whether SDR conversion before upload is necessary.
+    """
+    ensure_ffmpeg_installed()
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=color_transfer,color_primaries,color_space,width,height",
+        "-of", "default=noprint_wrappers=1",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise FFmpegError(
+            f"ffprobe failed for {video_path}: {exc.stderr.strip()}"
+        ) from exc
+
+    info: dict[str, str] = {}
+    for line in result.stdout.strip().splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            info[k.strip()] = v.strip()
+    return info
+
+
 def _scale_filter(width: int, height: int) -> str:
     return (
         f"scale={width}:{height}:flags=lanczos:"
@@ -85,41 +115,27 @@ def _scale_filter(width: int, height: int) -> str:
     )
 
 
-def _hlg_to_sdr_filter_chain(width: int, height: int) -> str:
-    """Scale + convert HLG (BT.2020) → SDR (BT.709) for the Mirage upload intermediate.
+def _hlg_passthrough_filter_chain(width: int, height: int) -> str:
+    """Scale only — no colorspace conversion.
 
-    The raw .mov source files are natively BT.2020 HLG (confirmed via macOS Get Info).
-    Mirage expects a standard SDR input to apply captions correctly, so we convert
-    down to BT.709 here. The HLG grade is restored in remux_and_upscale after Mirage
-    returns the captioned file.
+    TEST BRANCH: sends HLG source directly to Mirage without converting to SDR.
+    Output format is yuv420p (H.264 compatible) but colour metadata is NOT touched,
+    so if Mirage can handle HLG it will see the correct values.
     """
     scale = _scale_filter(width, height)
-    return (
-        f"{scale},"
-        "zscale=rangein=limited:range=full:"
-        "primariesin=bt2020:primaries=bt709:"
-        "matrixin=bt2020nc:matrix=bt709:"
-        "transferin=arib-std-b67:transfer=bt709,"
-        "format=yuv420p"
-    )
+    return f"{scale},format=yuv420p"
 
 
-def _upscale_hlg_filter_chain(width: int, height: int) -> str:
-    """Upscale Mirage output to target resolution, preserving HLG colour space.
+def _upscale_passthrough_filter_chain(width: int, height: int) -> str:
+    """Upscale + tag as HLG, but do NOT apply any zscale conversion.
 
-    The Mirage output is SDR BT.709 (it was converted before upload). We convert
-    it back to BT.2020 HLG here in a single zscale pass, then upscale to 4K.
-    No double-conversion: zscale runs exactly once in the whole pipeline.
+    TEST BRANCH: if Mirage preserved HLG, the pixel values are already correct
+    and we only need to scale + inject the BT.2020 metadata tags.
+    If the output looks wrong, it means Mirage stripped/changed the colour space
+    and we need the SDR->HLG zscale from main branch.
     """
     scale = _scale_filter(width, height)
-    return (
-        f"{scale},"
-        "zscale=rangein=full:range=limited:"
-        "primariesin=bt709:primaries=bt2020:"
-        "matrixin=bt709:matrix=bt2020nc:"
-        "transferin=bt709:transfer=arib-std-b67,"
-        "format=yuv420p10le"
-    )
+    return f"{scale},format=yuv420p10le"
 
 
 def _hlg_encode_args(crf: int) -> list[str]:
@@ -147,7 +163,7 @@ def _hlg_encode_args(crf: int) -> list[str]:
 
 
 def _sdr_encode_args(crf: int) -> list[str]:
-    """libx264 encode args for SDR delivery (Mirage upload intermediate)."""
+    """libx264 encode args for SDR delivery."""
     return [
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
@@ -178,11 +194,12 @@ def trim_and_mix(
     video_crf: int,
 ) -> tuple[Path, list[str]]:
     """
-    Prepare the Mirage upload intermediate: trim, scale, mix audio, convert HLG→SDR.
+    Prepare the Mirage upload intermediate: trim, scale, mix audio.
 
-    Source .mov files are natively BT.2020 HLG. This step converts them to
-    SDR BT.709 (yuv420p) so Mirage receives a clean, standard input.
-    HLG is restored in remux_and_upscale after Mirage returns the captioned video.
+    TEST BRANCH (hlg-passthrough): HLG source is NOT converted to SDR.
+    Sends HLG pixel values directly to Mirage to test whether Mirage
+    handles HLG natively. probe_colorspace() is called on the Mirage
+    output in remux_and_upscale to inspect what came back.
 
     Returns the output path and a list of warning messages.
     """
@@ -204,11 +221,10 @@ def trim_and_mix(
         output_duration = target_duration
 
     warnings.append(
-        "Converting HLG source → SDR BT.709 for Mirage upload. "
-        "HLG will be restored after captioning."
+        "[hlg-passthrough] Sending HLG source directly to Mirage — NO SDR conversion."
     )
 
-    video_filter = _hlg_to_sdr_filter_chain(output_width, output_height)
+    video_filter = _hlg_passthrough_filter_chain(output_width, output_height)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -255,16 +271,11 @@ def remux_and_upscale(
     """
     Post-Mirage finalization step.
 
-    The Mirage output is SDR BT.709 (converted before upload).
-
-    upscale=True (default):
-        Upscales to output_width x output_height (e.g. 2160x3840) and converts
-        SDR BT.709 → HLG BT.2020 in a single zscale pass. Re-encodes with
-        libx265 10-bit. Output shows "4K HLG" in players and social platforms.
-
-    upscale=False:
-        Pure remux — stream-copies video, injects HLG container metadata flags.
-        Zero quality loss, but resolution stays as Mirage returned it (~1080p).
+    TEST BRANCH (hlg-passthrough):
+    Runs probe_colorspace() first and logs what Mirage returned.
+    No zscale conversion — just scale + HLG metadata tags.
+    If the output looks correct: Mirage preserved HLG and this branch
+    is the right approach. If colours are wrong: use main branch.
 
     Audio is always re-encoded to stereo AAC 192 kbps.
     """
@@ -273,14 +284,27 @@ def remux_and_upscale(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Log what Mirage actually returned so we can inspect it
+    try:
+        cs = probe_colorspace(input_path)
+        warnings.append(
+            f"[hlg-passthrough] Mirage output colorspace: "
+            f"transfer={cs.get('color_transfer', 'N/A')} "
+            f"primaries={cs.get('color_primaries', 'N/A')} "
+            f"matrix={cs.get('color_space', 'N/A')} "
+            f"{cs.get('width', '?')}x{cs.get('height', '?')}"
+        )
+    except FFmpegError as exc:
+        warnings.append(f"[hlg-passthrough] Could not probe Mirage output: {exc}")
+
     if upscale:
         src_w, src_h = get_video_resolution(input_path)
         if src_w != output_width or src_h != output_height:
             warnings.append(
-                f"Upscaling Mirage output {src_w}x{src_h} → "
-                f"{output_width}x{output_height} + restoring HLG."
+                f"Upscaling Mirage output {src_w}x{src_h} \u2192 "
+                f"{output_width}x{output_height} (scale + HLG tags, no zscale)."
             )
-        video_filter = _upscale_hlg_filter_chain(output_width, output_height)
+        video_filter = _upscale_passthrough_filter_chain(output_width, output_height)
         cmd = [
             "ffmpeg",
             "-y",
