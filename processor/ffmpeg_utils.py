@@ -85,16 +85,31 @@ def _scale_filter(width: int, height: int) -> str:
     )
 
 
-def _sdr_filter_chain(width: int, height: int) -> str:
-    """Simple SDR scale — used for Mirage upload intermediate."""
-    return f"{_scale_filter(width, height)},format=yuv420p"
+def _hlg_to_sdr_filter_chain(width: int, height: int) -> str:
+    """Scale + convert HLG (BT.2020) → SDR (BT.709) for the Mirage upload intermediate.
+
+    The raw .mov source files are natively BT.2020 HLG (confirmed via macOS Get Info).
+    Mirage expects a standard SDR input to apply captions correctly, so we convert
+    down to BT.709 here. The HLG grade is restored in remux_and_upscale after Mirage
+    returns the captioned file.
+    """
+    scale = _scale_filter(width, height)
+    return (
+        f"{scale},"
+        "zscale=rangein=limited:range=full:"
+        "primariesin=bt2020:primaries=bt709:"
+        "matrixin=bt2020nc:matrix=bt709:"
+        "transferin=arib-std-b67:transfer=bt709,"
+        "format=yuv420p"
+    )
 
 
 def _upscale_hlg_filter_chain(width: int, height: int) -> str:
-    """Upscale to target resolution and convert SDR (BT.709) → HLG (BT.2020 / arib-std-b67).
+    """Upscale Mirage output to target resolution, preserving HLG colour space.
 
-    Applied AFTER Mirage returns the captioned video, so zscale runs only once.
-    The Mirage output is treated as BT.709 SDR regardless of what tags it carries.
+    The Mirage output is SDR BT.709 (it was converted before upload). We convert
+    it back to BT.2020 HLG here in a single zscale pass, then upscale to 4K.
+    No double-conversion: zscale runs exactly once in the whole pipeline.
     """
     scale = _scale_filter(width, height)
     return (
@@ -163,11 +178,11 @@ def trim_and_mix(
     video_crf: int,
 ) -> tuple[Path, list[str]]:
     """
-    Prepare the Mirage upload intermediate: trim, scale to 9:16 portrait, mix audio.
+    Prepare the Mirage upload intermediate: trim, scale, mix audio, convert HLG→SDR.
 
-    Output is SDR (BT.709 / yuv420p) — intentionally NO HLG conversion here.
-    HLG is applied only in remux_and_upscale, after Mirage returns the captioned video.
-    This avoids the double-zscale degradation that occurred in the previous pipeline.
+    Source .mov files are natively BT.2020 HLG. This step converts them to
+    SDR BT.709 (yuv420p) so Mirage receives a clean, standard input.
+    HLG is restored in remux_and_upscale after Mirage returns the captioned video.
 
     Returns the output path and a list of warning messages.
     """
@@ -188,7 +203,12 @@ def trim_and_mix(
     else:
         output_duration = target_duration
 
-    video_filter = _sdr_filter_chain(output_width, output_height)
+    warnings.append(
+        "Converting HLG source → SDR BT.709 for Mirage upload. "
+        "HLG will be restored after captioning."
+    )
+
+    video_filter = _hlg_to_sdr_filter_chain(output_width, output_height)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -235,20 +255,18 @@ def remux_and_upscale(
     """
     Post-Mirage finalization step.
 
-    Two modes depending on `upscale`:
+    The Mirage output is SDR BT.709 (converted before upload).
 
     upscale=True (default):
-        Re-encodes video with libx265 to `output_width x output_height` (e.g. 2160x3840),
-        converting SDR→HLG in a single zscale pass and injecting BT.2020/arib-std-b67
-        metadata.  Audio is stream-copied (no re-encode).
-        Output will show "4K HLG" in media players and social platforms.
+        Upscales to output_width x output_height (e.g. 2160x3840) and converts
+        SDR BT.709 → HLG BT.2020 in a single zscale pass. Re-encodes with
+        libx265 10-bit. Output shows "4K HLG" in players and social platforms.
 
     upscale=False:
-        Pure remux — stream-copies both video and audio, injects HLG container
-        metadata flags only.  Zero quality loss, but resolution stays as Mirage
-        returned it (typically 1080p).  Use when you do not need 4K metadata.
+        Pure remux — stream-copies video, injects HLG container metadata flags.
+        Zero quality loss, but resolution stays as Mirage returned it (~1080p).
 
-    In both modes audio is forced to stereo AAC 192 kbps to guarantee stereo output.
+    Audio is always re-encoded to stereo AAC 192 kbps.
     """
     ensure_ffmpeg_installed()
     warnings: list[str] = []
@@ -260,7 +278,7 @@ def remux_and_upscale(
         if src_w != output_width or src_h != output_height:
             warnings.append(
                 f"Upscaling Mirage output {src_w}x{src_h} → "
-                f"{output_width}x{output_height} with HLG tagging."
+                f"{output_width}x{output_height} + restoring HLG."
             )
         video_filter = _upscale_hlg_filter_chain(output_width, output_height)
         cmd = [
