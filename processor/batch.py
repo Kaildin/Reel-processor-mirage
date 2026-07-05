@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -11,6 +13,18 @@ from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Table
 
 from processor.config import Config
 from processor.exceptions import (
@@ -24,6 +38,7 @@ from processor.exceptions import (
 from processor.ffmpeg_utils import (
     check_file_size_warning,
     ensure_ffmpeg_installed,
+    get_duration_seconds,
     remux_and_upscale,
     trim_and_mix,
 )
@@ -95,29 +110,135 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _print_progress(
+def _make_step_progress() -> Progress:
+    """Progress bar used for individual FFmpeg steps (TRIM / FINALIZE)."""
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=28),
+        TextColumn("{task.percentage:>5.1f}%"),
+        TimeElapsedColumn(),
+        transient=False,
+    )
+
+
+def _make_batch_progress() -> Progress:
+    """Overall batch progress bar (1 per folder)."""
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[bold white]{task.description}"),
+        BarColumn(bar_width=36),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+    )
+
+
+def _poll_with_spinner(
+    client: MirageClient,
+    video_id: str,
     console: Console,
-    current: int,
-    total: int,
     basename: str,
-    state: PipelineState,
-) -> None:
-    line = f"[{current}/{total}] {basename} → {state.format_status_line()}"
-    console.print(line)
+) -> dict[str, Any]:
+    """Poll Mirage with a live spinner showing elapsed time and attempt count."""
+    interval = client._config.poll_interval_seconds
+    max_attempts = client._config.max_poll_attempts
+
+    spin_progress = Progress(
+        SpinnerColumn("dots"),
+        TextColumn("[yellow]{task.description}"),
+        TimeElapsedColumn(),
+        transient=True,
+    )
+    task = spin_progress.add_task(f"PROCESSING {basename}  attempt 1/{max_attempts}", total=None)
+
+    with Live(spin_progress, console=console, refresh_per_second=10):
+        for attempt in range(1, max_attempts + 1):
+            spin_progress.update(
+                task,
+                description=(
+                    f"PROCESSING {basename}  "
+                    f"attempt {attempt}/{max_attempts}  "
+                    f"(polling every {interval}s)"
+                ),
+            )
+            data = client.get_video_status(video_id)
+            status = data.get("status", "UNKNOWN")
+
+            if status == "COMPLETE":
+                spin_progress.update(task, description=f"PROCESSING {basename}  ✓ complete")
+                return data
+
+            if status in {"FAILED", "CANCELLED"}:
+                error = data.get("error") or {}
+                raise MirageJobFailedError(
+                    message=f"Mirage job {status}: {error.get('message', 'No details')}",
+                    status=status,
+                    error_code=error.get("code"),
+                    error_message=error.get("message"),
+                )
+
+            if attempt < max_attempts:
+                time.sleep(interval)
+
+    raise MiragePollTimeoutError(
+        f"Polling timed out after {max_attempts} attempts "
+        f"({max_attempts * interval}s) for video {video_id}"
+    )
 
 
-def _should_process_only_failed(
-    folder_number: int,
-    output_path: Path,
-    previous_log: list[dict[str, Any]],
-) -> bool:
-    if output_path.exists():
-        return False
+def _upload_with_progress(
+    client: MirageClient,
+    intermediate: Path,
+    console: Console,
+    basename: str,
+) -> str:
+    """Upload with a spinner + live byte counter."""
+    file_size = intermediate.stat().st_size
+    uploaded_bytes: list[int] = [0]
+    video_id_holder: list[str] = [""]
+    error_holder: list[Exception | None] = [None]
 
-    for entry in reversed(previous_log):
-        if entry.get("folder_number") == folder_number:
-            return entry.get("status") == "failed"
-    return True
+    up_progress = Progress(
+        SpinnerColumn("bouncingBar"),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=28),
+        TextColumn("{task.percentage:>5.1f}%"),
+        TimeElapsedColumn(),
+        transient=True,
+    )
+    task = up_progress.add_task(f"UPLOAD {basename}", total=file_size)
+
+    def _do_upload() -> None:
+        try:
+            video_id_holder[0] = client.upload_for_captions(intermediate)
+        except Exception as exc:  # noqa: BLE001
+            error_holder[0] = exc
+
+    thread = threading.Thread(target=_do_upload, daemon=True)
+
+    with Live(up_progress, console=console, refresh_per_second=10):
+        thread.start()
+        while thread.is_alive():
+            # Approximate progress by checking how many bytes have been read
+            # from the file (the upload stream hasn't completed yet).
+            try:
+                current = intermediate.stat().st_size  # file won't change; keep at max
+            except OSError:
+                current = 0
+            # We can't hook into requests internals easily, so we animate
+            # the spinner and advance the bar smoothly as time passes.
+            elapsed = up_progress.tasks[0].elapsed or 0.0
+            # Assume ~2 MB/s upload; cap at 95% until thread finishes.
+            estimated = min(int(elapsed * 2 * 1024 * 1024), int(file_size * 0.95))
+            up_progress.update(task, completed=estimated)
+            time.sleep(0.2)
+
+        up_progress.update(task, completed=file_size, description=f"UPLOAD {basename}  ✓")
+
+    if error_holder[0] is not None:
+        raise error_holder[0]  # type: ignore[misc]
+
+    return video_id_holder[0]
 
 
 def process_folder(
@@ -135,6 +256,9 @@ def process_folder(
     basename = scan_result.basename or "unknown"
     final_output = output_path_for(scan_result)
     state = PipelineState()
+
+    header = f"[bold]Folder {folder_number}/{total}[/bold]  {basename}"
+    console.rule(header)
 
     def make_entry(
         status: RunStatus,
@@ -154,8 +278,7 @@ def process_folder(
         )
 
     if not scan_result.is_processable:
-        state.set_step(PipelineStep.TRIM, "⊘")
-        _print_progress(console, current, total, basename, state)
+        console.print(f"  [dim]⊘ Skipped ({scan_result.status.value}): {scan_result.message}[/dim]")
         return make_entry(
             RunStatus.SKIPPED,
             skip_reason=scan_result.status.value,
@@ -163,8 +286,7 @@ def process_folder(
         )
 
     if final_output.exists() and not force:
-        state.set_step(PipelineStep.COMPLETE, "⊘ skip")
-        _print_progress(console, current, total, basename, state)
+        console.print("  [dim]⊘ Output already exists — skipping (use --force to overwrite)[/dim]")
         return make_entry(
             RunStatus.SKIPPED,
             skip_reason="output_exists",
@@ -172,11 +294,7 @@ def process_folder(
         )
 
     if dry_run:
-        state.set_step(PipelineStep.TRIM, "✓ (dry)")
-        state.set_step(PipelineStep.UPLOAD, "✓ (dry)")
-        state.set_step(PipelineStep.PROCESSING, "… (dry)")
-        state.set_step(PipelineStep.COMPLETE, "✓ (dry)")
-        _print_progress(console, current, total, basename, state)
+        console.print("  [dim]dry-run: TRIM ✓ | UPLOAD ✓ | PROCESSING … | COMPLETE ✓[/dim]")
         return make_entry(RunStatus.SUCCESS, output=final_output)
 
     try:
@@ -187,75 +305,75 @@ def process_folder(
             intermediate = Path(tmp_dir) / f"{basename}_upload.mp4"
             captioned_raw = Path(tmp_dir) / f"{basename}_captioned_raw.mp4"
 
-            state.set_step(PipelineStep.TRIM, "…")
-            _print_progress(console, current, total, basename, state)
+            # ── Step 1: TRIM (FFmpeg with live progress bar) ─────────────────
+            trim_progress = _make_step_progress()
+            trim_task = trim_progress.add_task("TRIM  preparing…", total=100)
 
-            # Step 1: Prepare upload intermediate — SDR only, NO HLG conversion.
-            # Mirage is treated as a captions-only service; colour grade happens
-            # in step 3 (remux_and_upscale) on the returned file.
-            _, trim_warnings = trim_and_mix(
-                scan_result.video_path,  # type: ignore[arg-type]
-                scan_result.audio_path,  # type: ignore[arg-type]
-                config.background_music,
-                intermediate,
-                music_volume_db=config.music_volume_db,
-                voiceover_gain_db=config.voiceover_gain_db,
-                trim_extra_seconds=config.video_trim_extra_seconds,
-                output_width=config.output_width,
-                output_height=config.output_height,
-                video_crf=config.mirage_upload_crf,
-            )
+            with Live(trim_progress, console=console, refresh_per_second=15):
+                _, trim_warnings = trim_and_mix(
+                    scan_result.video_path,  # type: ignore[arg-type]
+                    scan_result.audio_path,  # type: ignore[arg-type]
+                    config.background_music,
+                    intermediate,
+                    music_volume_db=config.music_volume_db,
+                    voiceover_gain_db=config.voiceover_gain_db,
+                    trim_extra_seconds=config.video_trim_extra_seconds,
+                    output_width=config.output_width,
+                    output_height=config.output_height,
+                    video_crf=config.mirage_upload_crf,
+                    progress=trim_progress,
+                    task_id=trim_task,
+                )
 
             for warning in trim_warnings:
-                console.print(f"  [yellow]⚠ {warning}[/yellow]")
+                console.print(f"  [yellow]⚠  {warning}[/yellow]")
 
-            size_warning = check_file_size_warning(
-                intermediate, config.max_file_size_mb
-            )
+            size_warning = check_file_size_warning(intermediate, config.max_file_size_mb)
             if size_warning:
-                console.print(f"  [yellow]⚠ {size_warning}[/yellow]")
+                console.print(f"  [yellow]⚠  {size_warning}[/yellow]")
 
-            state.set_step(PipelineStep.TRIM, "✓")
-            state.set_step(PipelineStep.UPLOAD, "…")
-            _print_progress(console, current, total, basename, state)
+            # ── Step 2: UPLOAD (spinner + simulated byte progress) ───────────
+            video_id = _upload_with_progress(client, intermediate, console, basename)
 
-            # Step 2: Mirage — upload → poll → download
-            video_id = client.upload_for_captions(intermediate)
+            # ── Step 3: PROCESSING (Mirage polling spinner) ──────────────────
+            _poll_with_spinner(client, video_id, console, basename)
 
-            state.set_step(PipelineStep.UPLOAD, "✓")
-            state.set_step(PipelineStep.PROCESSING, "…")
-            _print_progress(console, current, total, basename, state)
-
-            client.poll_until_complete(video_id)
-
-            state.set_step(PipelineStep.PROCESSING, "✓")
-            state.set_step(PipelineStep.COMPLETE, "…")
-            _print_progress(console, current, total, basename, state)
-
-            client.download_video(video_id, captioned_raw)
-
-            # Step 3: Post-Mirage finalization.
-            # upscale=True  → re-encode to 2160x3840 + HLG (shows 4K in players)
-            # upscale=False → remux only, inject HLG tags, zero quality loss
-            finalize_warnings = remux_and_upscale(
-                captioned_raw,
-                final_output,
-                output_width=config.output_width,
-                output_height=config.output_height,
-                video_crf=config.video_crf,
-                upscale=config.upscale_output,
+            # ── Step 4: DOWNLOAD ─────────────────────────────────────────────
+            dl_progress = Progress(
+                SpinnerColumn("bouncingBar"),
+                TextColumn("[bold cyan]{task.description}"),
+                TimeElapsedColumn(),
+                transient=True,
             )
+            dl_task = dl_progress.add_task(f"DOWNLOAD {basename}", total=None)
+            with Live(dl_progress, console=console, refresh_per_second=10):
+                client.download_video(video_id, captioned_raw)
+                dl_progress.update(dl_task, description=f"DOWNLOAD {basename}  ✓")
+
+            # ── Step 5: FINALIZE (FFmpeg re-encode with live progress bar) ───
+            fin_progress = _make_step_progress()
+            fin_task = fin_progress.add_task("FINALIZE  preparing…", total=100)
+
+            with Live(fin_progress, console=console, refresh_per_second=15):
+                finalize_warnings = remux_and_upscale(
+                    captioned_raw,
+                    final_output,
+                    output_width=config.output_width,
+                    output_height=config.output_height,
+                    video_crf=config.video_crf,
+                    upscale=config.upscale_output,
+                    progress=fin_progress,
+                    task_id=fin_task,
+                )
+
             for warning in finalize_warnings:
-                console.print(f"  [yellow]⚠ {warning}[/yellow]")
+                console.print(f"  [yellow]⚠  {warning}[/yellow]")
 
-            state.set_step(PipelineStep.COMPLETE, "✓")
-            _print_progress(console, current, total, basename, state)
-
+            console.print(f"  [bold green]✓ Done →[/bold green] {final_output}")
             return make_entry(RunStatus.SUCCESS, output=final_output)
 
     except MirageJobFailedError as exc:
-        state.set_step(PipelineStep.PROCESSING, "✗")
-        _print_progress(console, current, total, basename, state)
+        console.print(f"  [bold red]✗ PROCESSING failed:[/bold red] {exc}")
         error = f"{exc.status}"
         if exc.error_code:
             error += f" [{exc.error_code}]"
@@ -264,21 +382,30 @@ def process_folder(
         return make_entry(RunStatus.FAILED, error=error)
 
     except (MiragePollTimeoutError, MirageConnectionError, MirageAPIError) as exc:
-        if PipelineStep.UPLOAD in state.steps and PipelineStep.PROCESSING not in state.steps:
-            state.set_step(PipelineStep.UPLOAD, "✗")
-        else:
-            state.set_step(PipelineStep.PROCESSING, "✗")
-        _print_progress(console, current, total, basename, state)
+        console.print(f"  [bold red]✗ Mirage error:[/bold red] {exc}")
         return make_entry(RunStatus.FAILED, error=str(exc))
 
     except FFmpegError as exc:
-        state.set_step(PipelineStep.TRIM, "✗")
-        _print_progress(console, current, total, basename, state)
+        console.print(f"  [bold red]✗ FFmpeg error:[/bold red] {exc}")
         return make_entry(RunStatus.FAILED, error=str(exc))
 
     except ReelProcessorError as exc:
-        _print_progress(console, current, total, basename, state)
+        console.print(f"  [bold red]✗ Error:[/bold red] {exc}")
         return make_entry(RunStatus.FAILED, error=str(exc))
+
+
+def _should_process_only_failed(
+    folder_number: int,
+    output_path: Path,
+    previous_log: list[dict[str, Any]],
+) -> bool:
+    if output_path.exists():
+        return False
+
+    for entry in reversed(previous_log):
+        if entry.get("folder_number") == folder_number:
+            return entry.get("status") == "failed"
+    return True
 
 
 def run_batch(
@@ -314,6 +441,17 @@ def run_batch(
         )
 
     total = len(processable)
+
+    # ── Overall batch progress bar ────────────────────────────────────────────
+    batch_progress = _make_batch_progress()
+    batch_task = batch_progress.add_task(
+        f"[white]Batch ({total} folders)", total=total
+    )
+
+    console.print()
+    with Live(batch_progress, console=console, refresh_per_second=4):
+        pass  # print it once, then use console normally below
+
     entries: list[RunLogEntry] = []
 
     for idx, result in enumerate(processable, start=1):
@@ -327,6 +465,7 @@ def run_batch(
             total=total,
         )
         entries.append(entry)
+        batch_progress.update(batch_task, advance=1)
 
     skipped_scan = [
         RunLogEntry(
@@ -351,11 +490,12 @@ def run_batch(
     skipped = sum(1 for e in entries if e.status == RunStatus.SKIPPED)
 
     console.print()
+    console.rule("[bold]Batch complete[/bold]")
     console.print(
-        f"[bold green]{success} success[/bold green] | "
-        f"[bold red]{failed} failed[/bold red] | "
+        f"  [bold green]{success} success[/bold green]  "
+        f"[bold red]{failed} failed[/bold red]  "
         f"[bold yellow]{skipped} skipped[/bold yellow]"
     )
-    console.print(f"Run log saved to [cyan]{log_path}[/cyan]")
+    console.print(f"  Run log → [cyan]{log_path}[/cyan]")
 
     return entries

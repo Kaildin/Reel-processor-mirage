@@ -2,11 +2,33 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Optional
+
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+)
 
 from processor.exceptions import FFmpegError, FFmpegNotFoundError
+
+# Regex to parse FFmpeg progress lines from stderr:
+# frame=  120 fps= 30 q=28.0 size=    1024kB time=00:00:04.00 bitrate= ...
+_FFMPEG_PROGRESS_RE = re.compile(
+    r"frame=\s*(?P<frame>\d+).*?"
+    r"fps=\s*(?P<fps>[\d.]+).*?"
+    r"time=(?P<time>[\d:.]+).*?"
+    r"speed=\s*(?P<speed>[\d.]+)x",
+    re.DOTALL,
+)
+
 
 def ensure_ffmpeg_installed() -> None:
     for binary in ("ffmpeg", "ffprobe"):
@@ -174,7 +196,109 @@ def _sdr_encode_args(crf: int) -> list[str]:
     ]
 
 
+def _parse_time_to_seconds(time_str: str) -> float:
+    """Convert HH:MM:SS.ss string from FFmpeg to total seconds."""
+    try:
+        parts = time_str.split(":")
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        elif len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s)
+        return float(time_str)
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def run_ffmpeg_with_progress(
+    cmd: list[str],
+    duration_seconds: float,
+    progress: Progress,
+    task_id: TaskID,
+    label: str = "FFmpeg",
+) -> None:
+    """Run an FFmpeg command while streaming stderr to update a Rich progress bar.
+
+    FFmpeg is launched with ``-progress pipe:1 -nostats`` so it writes
+    key=value pairs to stdout every second.  stderr is kept for error
+    messages only.  Both streams are read in a background thread.
+
+    Args:
+        cmd: Full FFmpeg argv (must NOT already contain -progress/-nostats).
+        duration_seconds: Expected output duration used to compute %.
+        progress: An active ``rich.Progress`` instance.
+        task_id: The task to update inside *progress*.
+        label: Short description shown in the status column.
+    """
+    # Insert -progress pipe:1 -nostats right after 'ffmpeg'
+    augmented_cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
+
+    try:
+        proc = subprocess.Popen(
+            augmented_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        raise FFmpegError(f"ffmpeg executable not found: {exc}") from exc
+
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+
+    stderr_lines: list[str] = []
+    out_time_s: float = 0.0
+    speed: str = ""
+    fps: str = ""
+
+    # Read progress key=value pairs from stdout
+    for line in proc.stdout:
+        line = line.strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+
+        if key == "out_time":
+            out_time_s = _parse_time_to_seconds(value)
+        elif key == "speed":
+            speed = value
+        elif key == "fps":
+            fps = value
+        elif key == "progress":
+            # "progress=continue" or "progress=end"
+            if duration_seconds > 0:
+                pct = min(out_time_s / duration_seconds, 1.0)
+                completed = int(pct * 100)
+                desc_parts = [label]
+                if fps and fps not in ("0", "0.00", "N/A"):
+                    desc_parts.append(f"{fps}fps")
+                if speed and speed not in ("0x", "N/A"):
+                    desc_parts.append(f"{speed}")
+                progress.update(
+                    task_id,
+                    completed=completed,
+                    description=" ".join(desc_parts),
+                )
+
+    proc.wait()
+
+    # Drain stderr for error reporting
+    for line in proc.stderr:
+        stderr_lines.append(line)
+
+    if proc.returncode != 0:
+        stderr_text = "".join(stderr_lines).strip()
+        raise FFmpegError(f"ffmpeg failed (exit {proc.returncode}):\n{stderr_text}")
+
+    progress.update(task_id, completed=100, description=f"{label} ✓")
+
+
 def _run_ffmpeg(cmd: list[str]) -> None:
+    """Simple blocking FFmpeg run (no progress display). Kept for internal use."""
     try:
         subprocess.run(cmd, capture_output=True, text=True, check=True)
     except subprocess.CalledProcessError as exc:
@@ -193,6 +317,8 @@ def trim_and_mix(
     output_width: int,
     output_height: int,
     video_crf: int,
+    progress: Optional[Progress] = None,
+    task_id: Optional[TaskID] = None,
 ) -> tuple[Path, list[str]]:
     """
     Prepare the Mirage upload intermediate: trim, scale, mix audio, convert HLG->SDR.
@@ -256,7 +382,11 @@ def trim_and_mix(
         str(output_path),
     ]
 
-    _run_ffmpeg(cmd)
+    if progress is not None and task_id is not None:
+        run_ffmpeg_with_progress(cmd, output_duration, progress, task_id, label="TRIM")
+    else:
+        _run_ffmpeg(cmd)
+
     return output_path, warnings
 
 
@@ -268,6 +398,8 @@ def remux_and_upscale(
     output_height: int,
     video_crf: int,
     upscale: bool = True,
+    progress: Optional[Progress] = None,
+    task_id: Optional[TaskID] = None,
 ) -> list[str]:
     """
     Post-Mirage finalization step.
@@ -335,7 +467,16 @@ def remux_and_upscale(
             str(output_path),
         ]
 
-    _run_ffmpeg(cmd)
+    # For remux (stream copy) we can't report frame progress meaningfully;
+    # use a simple duration-based estimate from the source file.
+    duration = get_duration_seconds(input_path) if upscale else 0.0
+    label = "FINALIZE" if upscale else "FINALIZE (remux)"
+
+    if progress is not None and task_id is not None:
+        run_ffmpeg_with_progress(cmd, duration, progress, task_id, label=label)
+    else:
+        _run_ffmpeg(cmd)
+
     return warnings
 
 
