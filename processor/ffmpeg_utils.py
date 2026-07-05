@@ -133,33 +133,24 @@ def _hlg_passthrough_filter_chain(width: int, height: int) -> str:
 
 
 def _upscale_hlg_filter_chain(width: int, height: int) -> str:
-    """Upscale Mirage output + inject BT.2020 HLG metadata via zscale.
+    """Scale Mirage output to target resolution — no pixel color conversion.
 
-    Uses zscale to force (9-18-9) colour metadata into the bitstream so that
-    both the container colr box AND the x265 SEI NAL units carry correct values.
-    Input from Mirage is SDR BT.709 limited range (tv).
-    Output is BT.2020 HLG limited range for 4K HDR delivery.
+    The pixel values coming out of Mirage are already correct (HLG values
+    passed through unchanged). We only scale and convert to yuv420p10le for
+    the libx265 main10 encoder. Color metadata (bt2020, arib-std-b67, 9-18-9)
+    is injected via _hlg_encode_args flags and x265-params — not via a
+    colorspace filter, which would alter the pixel values and distort exposure.
     """
     scale = _scale_filter(width, height)
-    return (
-        f"{scale},"
-        "zscale=rangein=limited:range=limited:"
-        "primariesin=bt709:primaries=bt2020:"
-        "matrixin=bt709:matrix=bt2020nc:"
-        "transferin=bt709:transfer=arib-std-b67,"
-        "format=yuv420p10le"
-    )
+    return f"{scale},format=yuv420p10le"
 
 
 def _hlg_encode_args(crf: int) -> list[str]:
     """libx265 encode args for HLG 4K delivery targeting (9-18-9) on iOS.
 
-    Two-layer approach:
-    1. zscale filter (in _upscale_hlg_filter_chain) converts BT.709->BT.2020 HLG
-       so libx265 reads the correct frame metadata.
-    2. x265-params with NUMERIC values (9/18/9) forces SEI colour description
-       NAL units inside the HEVC bitstream.
-    3. Container-level flags write the ISO colr box that iOS AVFoundation reads.
+    x265-params with NUMERIC values (9/18/9) forces SEI colour description
+    NAL units inside the HEVC bitstream. Container-level flags write the
+    ISO colr box that iOS AVFoundation reads for the HDR badge.
     """
     x265_params = (
         "repeat-headers=1:"
@@ -277,7 +268,7 @@ def run_ffmpeg_with_progress(
         stderr_text = "".join(stderr_lines).strip()
         raise FFmpegError(f"ffmpeg failed (exit {proc.returncode}):\n{stderr_text}")
 
-    progress.update(task_id, completed=100, description=f"{label} ✓")
+    progress.update(task_id, completed=100, description=f"{label} \u2713")
 
 
 def _run_ffmpeg(cmd: list[str]) -> None:
@@ -384,8 +375,10 @@ def remux_and_upscale(
     Post-Mirage finalization step.
 
     TEST BRANCH (hlg-passthrough):
-    Probes colorspace of Mirage output, then upscales and converts
-    BT.709 -> BT.2020 HLG via zscale + numeric x265-params.
+    Probes colorspace of Mirage output, then upscales to target resolution.
+    NO pixel color conversion — the values coming out of Mirage are already
+    the correct HLG values. HLG metadata is injected only via encoder flags
+    and x265-params, not via zscale or any colorspace filter.
     """
     ensure_ffmpeg_installed()
     warnings: list[str] = []
@@ -408,7 +401,7 @@ def remux_and_upscale(
         if src_w != output_width or src_h != output_height:
             warnings.append(
                 f"Upscaling Mirage output {src_w}x{src_h} -> "
-                f"{output_width}x{output_height} + forcing HLG (9-18-9)."
+                f"{output_width}x{output_height} + injecting HLG (9-18-9) metadata."
             )
         video_filter = _upscale_hlg_filter_chain(output_width, output_height)
         cmd = [
