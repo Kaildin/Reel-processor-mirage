@@ -90,11 +90,7 @@ def get_file_size_mb(file_path: Path) -> float:
 
 
 def probe_colorspace(video_path: Path) -> dict[str, str]:
-    """Return color_transfer, color_primaries, color_space from ffprobe.
-
-    Used to inspect what Mirage actually returns so we can decide
-    whether SDR conversion before upload is necessary.
-    """
+    """Return color_transfer, color_primaries, color_space from ffprobe."""
     ensure_ffmpeg_installed()
     cmd = [
         "ffprobe",
@@ -128,35 +124,61 @@ def _scale_filter(width: int, height: int) -> str:
 
 
 def _hlg_passthrough_filter_chain(width: int, height: int) -> str:
-    """Scale only - no colorspace conversion.
+    """Scale only — no colorspace conversion.
 
     TEST BRANCH: sends HLG source directly to Mirage without converting to SDR.
-    Output format is yuv420p (H.264 compatible) but colour metadata is NOT touched,
-    so if Mirage can handle HLG it will see the correct values.
     """
     scale = _scale_filter(width, height)
     return f"{scale},format=yuv420p"
 
 
-def _upscale_passthrough_filter_chain(width: int, height: int) -> str:
-    """Upscale + tag as HLG, but do NOT apply any zscale conversion.
+def _upscale_hlg_filter_chain(width: int, height: int) -> str:
+    """Upscale + inject BT.2020 HLG metadata via setparams.
 
-    TEST BRANCH: if Mirage preserved HLG, the pixel values are already correct
-    and we only need to scale + inject the BT.2020 metadata tags.
-    If the output looks wrong, it means Mirage stripped/changed the colour space
-    and we need the SDR->HLG zscale from main branch.
+    setparams forces the (9-18-9) colour metadata into the bitstream
+    so that both the container colr box AND the x265 SEI NAL units
+    carry the correct values regardless of what the input stream says.
+    This is the authoritative fix for the (1-1-9) problem: FFmpeg's
+    -color_primaries/-color_trc flags only affect the container header,
+    while setparams additionally injects the values into the decoded
+    frame metadata that libx265 reads when writing SEI NAL units.
     """
     scale = _scale_filter(width, height)
-    return f"{scale},format=yuv420p10le"
-
-
-def _hlg_encode_args(crf: int) -> list[str]:
-    """libx265 encode args for HLG 4K delivery."""
-    x265_params = (
-        "repeat-headers=1:"
+    setparams = (
+        "setparams="
         "colorprim=bt2020:"
         "transfer=arib-std-b67:"
         "colormatrix=bt2020nc:"
+        "range=tv"
+    )
+    return f"{scale},{setparams},format=yuv420p10le"
+
+
+def _hlg_encode_args(crf: int) -> list[str]:
+    """libx265 encode args for HLG 4K delivery targeting (9-18-9) on iOS.
+
+    Three-layer approach to guarantee the badge:
+
+    1. setparams filter (in _upscale_hlg_filter_chain) — injects BT.2020 HLG
+       colour metadata into the decoded frame so libx265 reads it correctly.
+
+    2. x265-params with NUMERIC values (9/18/9) — forces the SEI colour
+       description NAL units inside the HEVC bitstream. String aliases
+       ("bt2020", "arib-std-b67") can silently fall back to defaults in
+       some libx265 builds; numeric ITU-T H.273 values never do.
+         colorprim=9    -> BT.2020
+         transfer=18    -> ARIB STD-B67 (HLG)
+         colormatrix=9  -> BT.2020 non-constant luminance
+
+    3. Container-level flags (-color_primaries, -color_trc, -colorspace,
+       -color_range, +write_colr) — writes the ISO 'colr' box that iOS
+       AVFoundation reads first when deciding whether to show the HDR badge.
+    """
+    x265_params = (
+        "repeat-headers=1:"
+        "colorprim=9:"
+        "transfer=18:"
+        "colormatrix=9:"
         "range=limited"
     )
     return [
@@ -166,6 +188,7 @@ def _hlg_encode_args(crf: int) -> list[str]:
         "-crf", str(crf),
         "-preset", "medium",
         "-tag:v", "hvc1",
+        # Container-level colour metadata (colr box)
         "-color_range", "tv",
         "-color_primaries", "bt2020",
         "-color_trc", "arib-std-b67",
@@ -176,7 +199,7 @@ def _hlg_encode_args(crf: int) -> list[str]:
 
 
 def _sdr_encode_args(crf: int) -> list[str]:
-    """libx264 encode args for SDR delivery."""
+    """libx264 encode args for SDR delivery (Mirage upload intermediate)."""
     return [
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
@@ -208,7 +231,7 @@ def run_ffmpeg_with_progress(
     task_id: TaskID,
     label: str = "FFmpeg",
 ) -> None:
-    """Run an FFmpeg command while streaming stderr to update a Rich progress bar."""
+    """Run an FFmpeg command while streaming stdout progress key=value pairs."""
     augmented_cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
 
     try:
@@ -299,8 +322,7 @@ def trim_and_mix(
 
     TEST BRANCH (hlg-passthrough): HLG source is NOT converted to SDR.
     Sends HLG pixel values directly to Mirage to test whether Mirage
-    handles HLG natively. probe_colorspace() is called on the Mirage
-    output in remux_and_upscale to inspect what came back.
+    handles HLG natively.
 
     Returns the output path and a list of warning messages.
     """
@@ -379,8 +401,8 @@ def remux_and_upscale(
     Post-Mirage finalization step.
 
     TEST BRANCH (hlg-passthrough):
-    Runs probe_colorspace() first and logs what Mirage returned.
-    No zscale conversion - just scale + HLG metadata tags.
+    Probes colorspace of Mirage output, then upscales and forces
+    BT.2020 HLG (9-18-9) via setparams filter + numeric x265-params.
     """
     ensure_ffmpeg_installed()
     warnings: list[str] = []
@@ -404,9 +426,11 @@ def remux_and_upscale(
         if src_w != output_width or src_h != output_height:
             warnings.append(
                 f"Upscaling Mirage output {src_w}x{src_h} -> "
-                f"{output_width}x{output_height} (scale + HLG tags, no zscale)."
+                f"{output_width}x{output_height} + forcing HLG (9-18-9)."
             )
-        video_filter = _upscale_passthrough_filter_chain(output_width, output_height)
+        # _upscale_hlg_filter_chain includes setparams to inject (9-18-9)
+        # before libx265 reads the frame metadata.
+        video_filter = _upscale_hlg_filter_chain(output_width, output_height)
         cmd = [
             "ffmpeg",
             "-y",
@@ -422,7 +446,7 @@ def remux_and_upscale(
         ]
     else:
         warnings.append(
-            "Remux only (no upscale): stream-copying video, injecting HLG container tags."
+            "Remux only (no upscale): stream-copying video, injecting HLG (9-18-9) container tags."
         )
         cmd = [
             "ffmpeg",
