@@ -86,7 +86,7 @@ def _scale_filter(width: int, height: int) -> str:
 
 
 def _hlg_to_sdr_filter_chain(width: int, height: int) -> str:
-    """Scale + convert HLG (BT.2020) → SDR (BT.709) for the Mirage upload intermediate.
+    """Scale + convert HLG (BT.2020) -> SDR (BT.709) for the Mirage upload intermediate.
 
     The raw .mov source files are natively BT.2020 HLG (confirmed via macOS Get Info).
     Mirage expects a standard SDR input to apply captions correctly, so we convert
@@ -105,7 +105,7 @@ def _hlg_to_sdr_filter_chain(width: int, height: int) -> str:
 
 
 def _upscale_hlg_filter_chain(width: int, height: int) -> str:
-    """Upscale Mirage output to target resolution, preserving HLG colour space.
+    """Upscale Mirage output to target resolution and restore HLG colour space.
 
     The Mirage output is SDR BT.709 (it was converted before upload). We convert
     it back to BT.2020 HLG here in a single zscale pass, then upscale to 4K.
@@ -122,14 +122,31 @@ def _upscale_hlg_filter_chain(width: int, height: int) -> str:
     )
 
 
+# Standard BT.2020 HLG display primaries (values x50000 per SMPTE ST 2086).
+# These SEI NAL units are required for iOS to display the HDR badge.
+_HLG_MASTER_DISPLAY = (
+    "G(13250,34500)B(7500,3000)R(34000,16000)"
+    "WP(15635,16450)L(10000000,1)"
+)
+_HLG_MAX_CLL = "1000,400"
+
+
 def _hlg_encode_args(crf: int) -> list[str]:
-    """libx265 encode args for HLG 4K delivery."""
+    """libx265 encode args for HLG 4K delivery.
+
+    Includes master-display and max-cll SEI metadata so that iOS
+    recognises the file as HDR and shows the HDR badge in Files / Photos.
+    Values are the standard BT.2020 HLG primaries (D65 white point,
+    peak luminance 1000 nits, max frame average 400 nits).
+    """
     x265_params = (
         "repeat-headers=1:"
         "colorprim=bt2020:"
         "transfer=arib-std-b67:"
         "colormatrix=bt2020nc:"
-        "range=limited"
+        "range=limited:"
+        f"master-display={_HLG_MASTER_DISPLAY}:"
+        f"max-cll={_HLG_MAX_CLL}"
     )
     return [
         "-c:v", "libx265",
@@ -178,7 +195,7 @@ def trim_and_mix(
     video_crf: int,
 ) -> tuple[Path, list[str]]:
     """
-    Prepare the Mirage upload intermediate: trim, scale, mix audio, convert HLG→SDR.
+    Prepare the Mirage upload intermediate: trim, scale, mix audio, convert HLG->SDR.
 
     Source .mov files are natively BT.2020 HLG. This step converts them to
     SDR BT.709 (yuv420p) so Mirage receives a clean, standard input.
@@ -204,7 +221,7 @@ def trim_and_mix(
         output_duration = target_duration
 
     warnings.append(
-        "Converting HLG source → SDR BT.709 for Mirage upload. "
+        "Converting HLG source -> SDR BT.709 for Mirage upload. "
         "HLG will be restored after captioning."
     )
 
@@ -259,11 +276,12 @@ def remux_and_upscale(
 
     upscale=True (default):
         Upscales to output_width x output_height (e.g. 2160x3840) and converts
-        SDR BT.709 → HLG BT.2020 in a single zscale pass. Re-encodes with
-        libx265 10-bit. Output shows "4K HLG" in players and social platforms.
+        SDR BT.709 -> HLG BT.2020 in a single zscale pass. Re-encodes with
+        libx265 10-bit. Output shows "4K HLG" in media players and iOS Files.
+        iOS HDR badge is triggered by master-display + max-cll SEI metadata.
 
     upscale=False:
-        Pure remux — stream-copies video, injects HLG container metadata flags.
+        Pure remux -- stream-copies video, injects HLG container metadata flags.
         Zero quality loss, but resolution stays as Mirage returned it (~1080p).
 
     Audio is always re-encoded to stereo AAC 192 kbps.
@@ -277,7 +295,7 @@ def remux_and_upscale(
         src_w, src_h = get_video_resolution(input_path)
         if src_w != output_width or src_h != output_height:
             warnings.append(
-                f"Upscaling Mirage output {src_w}x{src_h} → "
+                f"Upscaling Mirage output {src_w}x{src_h} -> "
                 f"{output_width}x{output_height} + restoring HLG."
             )
         video_filter = _upscale_hlg_filter_chain(output_width, output_height)
