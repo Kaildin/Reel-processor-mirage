@@ -138,34 +138,41 @@ def _upscale_passthrough_filter_chain(width: int, height: int) -> str:
     return f"{scale},format=yuv420p10le"
 
 
-# Standard BT.2020 HLG display primaries (values x50000 per SMPTE ST 2086).
-# These SEI NAL units are required for iOS to display the HDR badge.
-_HLG_MASTER_DISPLAY = (
-    "G(13250,34500)B(7500,3000)R(34000,16000)"
-    "WP(15635,16450)L(10000000,1)"
-)
-_HLG_MAX_CLL = "1000,400"
-
-
 def _hlg_encode_args(crf: int) -> list[str]:
     """libx265 encode args for HLG 4K delivery.
 
-    Includes master-display and max-cll SEI metadata so that iOS
-    recognises the file as HDR and shows the HDR badge in Files / Photos.
-    Values are the standard BT.2020 HLG primaries (D65 white point,
-    peak luminance 1000 nits, max frame average 400 nits).
+    Key fixes for iOS HDR badge recognition:
+
+    1. -movflags +write_colr: writes the ISO 'colr' box in the container.
+       iOS/QuickTime reads this box first when deciding whether to show
+       the HDR badge — before inspecting x265 SEI NAL units.
+
+    2. -profile:v main10: explicitly forces HEVC Main10 profile.
+       Without this, libx265 may silently encode as 'Main' even when
+       yuv420p10le is requested. iOS uses the HEVC profile level to
+       gate HDR recognition.
+
+    3. master-display and max-cll are intentionally OMITTED.
+       Those are SMPTE ST 2086 / CEA-861.3 metadata for HDR10
+       (a display-referred format). HLG (ARIB STD-B67) is scene-referred
+       and does not carry absolute luminance metadata. Including HDR10
+       SEI in an HLG stream can cause iOS to misidentify the file as
+       malformed HDR10 and refuse to display the badge.
+
+    The combination of colr box + Main10 profile + arib-std-b67 transfer
+    matches what Apple AVFoundation writes when exporting HLG from Photos
+    or Final Cut Pro X.
     """
     x265_params = (
         "repeat-headers=1:"
         "colorprim=bt2020:"
         "transfer=arib-std-b67:"
         "colormatrix=bt2020nc:"
-        "range=limited:"
-        f"master-display={_HLG_MASTER_DISPLAY}:"
-        f"max-cll={_HLG_MAX_CLL}"
+        "range=limited"
     )
     return [
         "-c:v", "libx265",
+        "-profile:v", "main10",
         "-pix_fmt", "yuv420p10le",
         "-crf", str(crf),
         "-preset", "medium",
@@ -174,7 +181,7 @@ def _hlg_encode_args(crf: int) -> list[str]:
         "-color_primaries", "bt2020",
         "-color_trc", "arib-std-b67",
         "-colorspace", "bt2020nc",
-        "-movflags", "+faststart",
+        "-movflags", "+faststart+write_colr",
         "-x265-params", x265_params,
     ]
 
@@ -354,7 +361,7 @@ def remux_and_upscale(
             "-c:a", "aac",
             "-b:a", "192k",
             "-ac", "2",
-            "-movflags", "+faststart",
+            "-movflags", "+faststart+write_colr",
             str(output_path),
         ]
 
