@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import RequestException, Timeout
+from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 
 from processor.config import Config
 from processor.exceptions import (
@@ -78,15 +79,41 @@ class MirageClient:
             f"Request failed after retries: {last_error}"
         )
 
-    def upload_for_captions(self, video_path: Path) -> str:
+    def upload_for_captions(
+        self,
+        video_path: Path,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> str:
+        """Upload *video_path* and return the Mirage video_id.
+
+        If *progress_callback* is provided it is called with
+        ``(bytes_sent, total_bytes)`` after each chunk so the caller can
+        drive a Rich progress bar with real byte counts.
+        """
         url = self._url("/videos/captions")
+        file_size = video_path.stat().st_size
+
         with video_path.open("rb") as video_file:
+            encoder = MultipartEncoder(
+                fields={
+                    "caption_template_id": self._config.caption_template_id,
+                    "video": (video_path.name, video_file, "video/mp4"),
+                }
+            )
+
+            def _monitor_callback(monitor: MultipartEncoderMonitor) -> None:
+                if progress_callback is not None:
+                    progress_callback(monitor.bytes_read, file_size)
+
+            monitor = MultipartEncoderMonitor(encoder, _monitor_callback)
+
             response = self._request_with_retry(
                 "POST",
                 url,
-                data={"caption_template_id": self._config.caption_template_id},
-                files={"video": (video_path.name, video_file, "video/mp4")},
+                data=monitor,
+                headers={"Content-Type": monitor.content_type},
             )
+
         data = response.json()
         video_id = data.get("id") or data.get("video_id")
         if not video_id:
@@ -126,11 +153,34 @@ class MirageClient:
             f"({max_attempts * interval}s) for video {video_id}"
         )
 
-    def download_video(self, video_id: str, output_path: Path) -> Path:
+    def download_video(
+        self,
+        video_id: str,
+        output_path: Path,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> Path:
+        """Download the captioned video, optionally reporting progress.
+
+        *progress_callback* is called with ``(bytes_downloaded, total_bytes)``
+        after each chunk.  *total_bytes* is -1 when Content-Length is absent.
+        """
         url = self._url(f"/videos/{video_id}/content")
-        response = self._request_with_retry("GET", url, allow_redirects=True)
+        response = self._request_with_retry(
+            "GET", url, allow_redirects=True, stream=True
+        )
+        total = int(response.headers.get("Content-Length", -1))
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(response.content)
+
+        downloaded = 0
+        with output_path.open("wb") as fh:
+            for chunk in response.iter_content(chunk_size=256 * 1024):
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback is not None:
+                    progress_callback(downloaded, total)
+
         return output_path
 
     def list_caption_templates(self) -> list[dict[str, Any]]:
