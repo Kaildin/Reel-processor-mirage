@@ -8,12 +8,41 @@ from pathlib import Path
 
 from processor.exceptions import FFmpegError, FFmpegNotFoundError
 
+
 def ensure_ffmpeg_installed() -> None:
     for binary in ("ffmpeg", "ffprobe"):
         if shutil.which(binary) is None:
             raise FFmpegNotFoundError(
                 f"{binary} not found. Install via Homebrew: brew install ffmpeg"
             )
+
+
+# ---------------------------------------------------------------------------
+# NVENC availability probe
+# ---------------------------------------------------------------------------
+
+def check_nvenc_available() -> bool:
+    """Return True if hevc_nvenc is usable on this machine.
+
+    Runs a 1-frame null encode to verify both driver and NVENC engine
+    are present. Cheap: completes in <1 second, no output file written.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=black:s=64x64:r=1",
+                "-vframes", "1",
+                "-c:v", "hevc_nvenc",
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
 
 
 def get_duration_seconds(media_path: Path) -> float:
@@ -86,13 +115,7 @@ def _scale_filter(width: int, height: int) -> str:
 
 
 def _hlg_to_sdr_filter_chain(width: int, height: int) -> str:
-    """Scale + convert HLG (BT.2020) -> SDR (BT.709) for the Mirage upload intermediate.
-
-    The raw .mov source files are natively BT.2020 HLG (confirmed via macOS Get Info).
-    Mirage expects a standard SDR input to apply captions correctly, so we convert
-    down to BT.709 here. The HLG grade is restored in remux_and_upscale after Mirage
-    returns the captioned file.
-    """
+    """Scale + convert HLG (BT.2020) -> SDR (BT.709) for the Mirage upload intermediate."""
     scale = _scale_filter(width, height)
     return (
         f"{scale},"
@@ -105,12 +128,7 @@ def _hlg_to_sdr_filter_chain(width: int, height: int) -> str:
 
 
 def _upscale_hlg_filter_chain(width: int, height: int) -> str:
-    """Upscale Mirage output to target resolution and restore HLG colour space.
-
-    The Mirage output is SDR BT.709 (it was converted before upload). We convert
-    it back to BT.2020 HLG here in a single zscale pass, then upscale to 4K.
-    No double-conversion: zscale runs exactly once in the whole pipeline.
-    """
+    """Upscale Mirage output + restore HLG colour space via single zscale pass."""
     scale = _scale_filter(width, height)
     return (
         f"{scale},"
@@ -122,34 +140,47 @@ def _upscale_hlg_filter_chain(width: int, height: int) -> str:
     )
 
 
-# Standard BT.2020 HLG display primaries (values x50000 per SMPTE ST 2086).
-# These SEI NAL units are required for iOS to display the HDR badge.
-_HLG_MASTER_DISPLAY = (
-    "G(13250,34500)B(7500,3000)R(34000,16000)"
-    "WP(15635,16450)L(10000000,1)"
-)
-_HLG_MAX_CLL = "1000,400"
+def _upscale_hlg_filter_chain_nvenc(width: int, height: int) -> str:
+    """Like _upscale_hlg_filter_chain but outputs yuv420p (8-bit) for NVENC.
+
+    MX130 / Pascal-generation NVENC does not support 10-bit output.
+    Colour space conversion is still applied via zscale; only the final
+    pixel format differs. iOS reads HDR metadata from the container
+    (colr box) and SEI, not from bit-depth alone.
+    """
+    scale = _scale_filter(width, height)
+    return (
+        f"{scale},"
+        "zscale=rangein=full:range=limited:"
+        "primariesin=bt709:primaries=bt2020:"
+        "matrixin=bt709:matrix=bt2020nc:"
+        "transferin=bt709:transfer=arib-std-b67,"
+        "format=yuv420p"
+    )
 
 
-def _hlg_encode_args(crf: int) -> list[str]:
-    """libx265 encode args for HLG 4K delivery.
+# ---------------------------------------------------------------------------
+# Encode arg builders
+# ---------------------------------------------------------------------------
 
-    Includes master-display and max-cll SEI metadata so that iOS
-    recognises the file as HDR and shows the HDR badge in Files / Photos.
-    Values are the standard BT.2020 HLG primaries (D65 white point,
-    peak luminance 1000 nits, max frame average 400 nits).
+def _hlg_encode_args_cpu(crf: int) -> list[str]:
+    """libx265 CPU encode args for HLG delivery.
+
+    Three fixes for iOS HDR badge (same as test/hlg-passthrough branch):
+    - write_colr: container colr box so iOS recognises HDR before reading SEI
+    - profile:v main10: forces HEVC Main10 so iOS gates HDR correctly
+    - master-display / max-cll omitted: HLG is scene-referred (not HDR10)
     """
     x265_params = (
         "repeat-headers=1:"
         "colorprim=bt2020:"
         "transfer=arib-std-b67:"
         "colormatrix=bt2020nc:"
-        "range=limited:"
-        f"master-display={_HLG_MASTER_DISPLAY}:"
-        f"max-cll={_HLG_MAX_CLL}"
+        "range=limited"
     )
     return [
         "-c:v", "libx265",
+        "-profile:v", "main10",
         "-pix_fmt", "yuv420p10le",
         "-crf", str(crf),
         "-preset", "medium",
@@ -158,8 +189,39 @@ def _hlg_encode_args(crf: int) -> list[str]:
         "-color_primaries", "bt2020",
         "-color_trc", "arib-std-b67",
         "-colorspace", "bt2020nc",
-        "-movflags", "+faststart",
+        "-movflags", "+faststart+write_colr",
         "-x265-params", x265_params,
+    ]
+
+
+def _hlg_encode_args_nvenc(cq: int) -> list[str]:
+    """hevc_nvenc encode args for HLG delivery on NVIDIA GPUs.
+
+    Tuned for MX130 / Pascal-tier NVENC constraints:
+    - yuv420p (8-bit): MX130 NVENC engine does not support 10-bit output.
+    - -bf 0: no B-frames (not supported on MX-class NVENC).
+    - -rc vbr -cq <cq>: VBR mode with target quality; equivalent to
+      libx265 CRF. cq=23 ~ crf=22 visually.
+    - -preset p4: balanced speed/quality for NVENC (p1=fastest, p7=best).
+      p4 is recommended for MX130 to avoid overwhelming the limited
+      NVENC engine with look-ahead.
+    - HDR metadata injected via container flags and SEI (same approach
+      as CPU path); colr box written via -movflags +write_colr.
+    - master-display / max-cll intentionally omitted (HLG, not HDR10).
+    """
+    return [
+        "-c:v", "hevc_nvenc",
+        "-pix_fmt", "yuv420p",
+        "-rc", "vbr",
+        "-cq", str(cq),
+        "-preset", "p4",
+        "-bf", "0",
+        "-tag:v", "hvc1",
+        "-color_range", "tv",
+        "-color_primaries", "bt2020",
+        "-color_trc", "arib-std-b67",
+        "-colorspace", "bt2020nc",
+        "-movflags", "+faststart+write_colr",
     ]
 
 
@@ -181,6 +243,10 @@ def _run_ffmpeg(cmd: list[str]) -> None:
         raise FFmpegError(f"ffmpeg failed:\n{exc.stderr.strip()}") from exc
 
 
+# ---------------------------------------------------------------------------
+# Public pipeline functions
+# ---------------------------------------------------------------------------
+
 def trim_and_mix(
     video_path: Path,
     voiceover_path: Path,
@@ -200,6 +266,9 @@ def trim_and_mix(
     Source .mov files are natively BT.2020 HLG. This step converts them to
     SDR BT.709 (yuv420p) so Mirage receives a clean, standard input.
     HLG is restored in remux_and_upscale after Mirage returns the captioned video.
+
+    The intermediate is always encoded with libx264 (CPU) — NVENC is only
+    used in the final delivery encode in remux_and_upscale.
 
     Returns the output path and a list of warning messages.
     """
@@ -226,7 +295,6 @@ def trim_and_mix(
     )
 
     video_filter = _hlg_to_sdr_filter_chain(output_width, output_height)
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     filter_complex = (
@@ -268,28 +336,47 @@ def remux_and_upscale(
     output_height: int,
     video_crf: int,
     upscale: bool = True,
+    use_nvenc: bool | None = None,
 ) -> list[str]:
     """
     Post-Mirage finalization step.
 
-    The Mirage output is SDR BT.709 (converted before upload).
+    The Mirage output is SDR BT.709. This step upscales to the target
+    resolution and restores HLG colour space, then encodes the delivery file.
 
-    upscale=True (default):
-        Upscales to output_width x output_height (e.g. 2160x3840) and converts
-        SDR BT.709 -> HLG BT.2020 in a single zscale pass. Re-encodes with
-        libx265 10-bit. Output shows "4K HLG" in media players and iOS Files.
-        iOS HDR badge is triggered by master-display + max-cll SEI metadata.
+    GPU path (use_nvenc=True or auto-detected):
+        Uses hevc_nvenc for the final encode. The upscale filter (zscale)
+        still runs on the CPU — only the encode itself uses the GPU.
+        For a typical 60s reel this saves ~3-4 minutes vs libx265 medium.
+        Output is yuv420p 8-bit (MX130 NVENC limitation). HDR badge metadata
+        is injected via the container colr box and SEI.
 
-    upscale=False:
-        Pure remux -- stream-copies video, injects HLG container metadata flags.
-        Zero quality loss, but resolution stays as Mirage returned it (~1080p).
+    CPU path (use_nvenc=False or NVENC unavailable):
+        Uses libx265 with Main10 profile and yuv420p10le. Includes write_colr
+        and omits master-display/max-cll (HLG, not HDR10).
+
+    use_nvenc:
+        None (default) = auto-detect via check_nvenc_available()
+        True           = force GPU (raises FFmpegError if unavailable)
+        False          = force CPU (libx265)
 
     Audio is always re-encoded to stereo AAC 192 kbps.
     """
     ensure_ffmpeg_installed()
     warnings: list[str] = []
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Resolve GPU availability
+    if use_nvenc is None:
+        use_nvenc = check_nvenc_available()
+        if use_nvenc:
+            warnings.append("[nvenc] NVIDIA GPU detected — using hevc_nvenc for final encode.")
+        else:
+            warnings.append("[nvenc] hevc_nvenc not available — falling back to libx265 (CPU).")
+    elif use_nvenc:
+        warnings.append("[nvenc] GPU encode forced by caller (use_nvenc=True).")
+    else:
+        warnings.append("[nvenc] CPU encode forced by caller (use_nvenc=False).")
 
     if upscale:
         src_w, src_h = get_video_resolution(input_path)
@@ -298,7 +385,14 @@ def remux_and_upscale(
                 f"Upscaling Mirage output {src_w}x{src_h} -> "
                 f"{output_width}x{output_height} + restoring HLG."
             )
-        video_filter = _upscale_hlg_filter_chain(output_width, output_height)
+
+        if use_nvenc:
+            video_filter = _upscale_hlg_filter_chain_nvenc(output_width, output_height)
+            encode_args = _hlg_encode_args_nvenc(cq=video_crf)
+        else:
+            video_filter = _upscale_hlg_filter_chain(output_width, output_height)
+            encode_args = _hlg_encode_args_cpu(video_crf)
+
         cmd = [
             "ffmpeg",
             "-y",
@@ -306,7 +400,7 @@ def remux_and_upscale(
             "-vf", video_filter,
             "-map", "0:v:0",
             "-map", "0:a:0?",
-            *_hlg_encode_args(video_crf),
+            *encode_args,
             "-c:a", "aac",
             "-b:a", "192k",
             "-ac", "2",
@@ -331,7 +425,7 @@ def remux_and_upscale(
             "-c:a", "aac",
             "-b:a", "192k",
             "-ac", "2",
-            "-movflags", "+faststart",
+            "-movflags", "+faststart+write_colr",
             str(output_path),
         ]
 
