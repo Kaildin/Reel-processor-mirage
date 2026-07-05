@@ -2,17 +2,15 @@
 # Copy this file to config.yaml and fill in your values.
 
 # Path to the project root containing numbered subfolders (1/, 2/, 3/, ...)
-icloud_root: ~/Desktop/progetto RP
+icloud_root: "/Users/paolone/Library/Mobile Documents/com~apple~CloudDocs/Progetto RP"
 
-# Path where final captioned videos are saved
-output_dir: ~/Library/Mobile Documents/com~apple~CloudDocs/progetto RP/_output
+# Path where run_log.json is saved (final videos go inside numbered folders)
+output_dir: "/Users/paolone/Library/Mobile Documents/com~apple~CloudDocs/Progetto RP/_output"
 
 # Global background music file (loops automatically to match video length)
-# Can be mp3, m4a, etc. — independent from per-folder .m4a voiceovers
 background_music: ~/Music/background-track.mp3
 
 # Volume offset for background music relative to voiceover (in dB)
-# -25 means music is 25 dB quieter than the voiceover
 music_volume_db: -25
 
 # Gain applied to the voiceover track (in dB)
@@ -36,18 +34,22 @@ video_trim_extra_seconds: 1
 # Maximum output file size in MB for Mirage upload (warns if exceeded)
 max_file_size_mb: 50
 
-# Final export resolution — 4K vertical 9:16 (2160x3840)
+# Output resolution for upscale step — 4K vertical 9:16 (2160x3840)
 output_width: 2160
 output_height: 3840
 
-# Encode final client delivery as HLG HDR (HEVC 10-bit, BT.2020 / arib-std-b67)
-# Source .mov files are typically SDR; zscale converts to HLG for Mirage Captions reference.
-enable_hdr: true
+# Upscale Mirage output to output_width x output_height and convert to HLG.
+# true  → re-encode with libx265, zscale SDR→HLG, output shows "4K HLG" in players
+# false → remux only (stream-copy video), inject HLG container tags, no re-encode
+#         Use false if you want zero extra quality loss and don't need 4K metadata.
+upscale_output: true
 
-# CRF for final client export (lower = higher quality, larger file)
-video_crf: 20
+# CRF for the final upscale+HLG encode (only used when upscale_output: true)
+# Lower = higher quality, larger file. 18 is a good starting point for 4K HEVC.
+video_crf: 18
 
-# CRF for Mirage upload intermediate (lower = higher quality; default 24 balances size vs quality)
+# CRF for Mirage upload intermediate (SDR, no HLG). Higher values are fine here
+# since Mirage will re-encode anyway. 24 balances upload size vs. caption quality.
 mirage_upload_crf: 24
 
 # Mirage API base URL (change only if using a different environment)

@@ -24,7 +24,7 @@ from processor.exceptions import (
 from processor.ffmpeg_utils import (
     check_file_size_warning,
     ensure_ffmpeg_installed,
-    finalize_export,
+    remux_and_upscale,
     trim_and_mix,
 )
 from processor.mirage_api import MirageClient
@@ -74,11 +74,14 @@ class PipelineState:
 
 
 def output_filename(video_basename: str) -> str:
-    return f"captions_{video_basename}.mp4"
+    return f"Captions {video_basename}.mp4"
 
 
-def output_path_for(config: Config, video_basename: str) -> Path:
-    return config.output_dir / output_filename(video_basename)
+def output_path_for(scan_result: FolderScanResult) -> Path:
+    """Final output lives inside the numbered folder, next to the source files."""
+    basename = scan_result.basename or "unknown"
+    folder = scan_result.video_path.parent  # type: ignore[union-attr]
+    return folder / output_filename(basename)
 
 
 def load_previous_run_log(log_path: Path) -> list[dict[str, Any]]:
@@ -130,7 +133,7 @@ def process_folder(
     console = console or Console()
     folder_number = scan_result.folder_number
     basename = scan_result.basename or "unknown"
-    final_output = output_path_for(config, basename)
+    final_output = output_path_for(scan_result)
     state = PipelineState()
 
     def make_entry(
@@ -181,12 +184,15 @@ def process_folder(
         client = MirageClient(config)
 
         with tempfile.TemporaryDirectory(prefix="reel-processor-") as tmp_dir:
-            intermediate = Path(tmp_dir) / f"{basename}_trimmed.mp4"
+            intermediate = Path(tmp_dir) / f"{basename}_upload.mp4"
             captioned_raw = Path(tmp_dir) / f"{basename}_captioned_raw.mp4"
 
             state.set_step(PipelineStep.TRIM, "…")
             _print_progress(console, current, total, basename, state)
 
+            # Step 1: Prepare upload intermediate — SDR only, NO HLG conversion.
+            # Mirage is treated as a captions-only service; colour grade happens
+            # in step 3 (remux_and_upscale) on the returned file.
             _, trim_warnings = trim_and_mix(
                 scan_result.video_path,  # type: ignore[arg-type]
                 scan_result.audio_path,  # type: ignore[arg-type]
@@ -197,7 +203,6 @@ def process_folder(
                 trim_extra_seconds=config.video_trim_extra_seconds,
                 output_width=config.output_width,
                 output_height=config.output_height,
-                enable_hdr=config.enable_hdr,
                 video_crf=config.mirage_upload_crf,
             )
 
@@ -214,6 +219,7 @@ def process_folder(
             state.set_step(PipelineStep.UPLOAD, "…")
             _print_progress(console, current, total, basename, state)
 
+            # Step 2: Mirage — upload → poll → download
             video_id = client.upload_for_captions(intermediate)
 
             state.set_step(PipelineStep.UPLOAD, "✓")
@@ -228,13 +234,16 @@ def process_folder(
 
             client.download_video(video_id, captioned_raw)
 
-            finalize_warnings = finalize_export(
+            # Step 3: Post-Mirage finalization.
+            # upscale=True  → re-encode to 2160x3840 + HLG (shows 4K in players)
+            # upscale=False → remux only, inject HLG tags, zero quality loss
+            finalize_warnings = remux_and_upscale(
                 captioned_raw,
                 final_output,
                 output_width=config.output_width,
                 output_height=config.output_height,
-                enable_hdr=config.enable_hdr,
                 video_crf=config.video_crf,
+                upscale=config.upscale_output,
             )
             for warning in finalize_warnings:
                 console.print(f"  [yellow]⚠ {warning}[/yellow]")
@@ -296,7 +305,7 @@ def run_batch(
     if only_failed:
         filtered: list[FolderScanResult] = []
         for result in processable:
-            out = output_path_for(config, result.basename or "unknown")
+            out = output_path_for(result)
             if _should_process_only_failed(result.folder_number, out, previous_log):
                 filtered.append(result)
         processable = filtered

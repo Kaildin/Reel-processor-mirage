@@ -85,11 +85,16 @@ def _scale_filter(width: int, height: int) -> str:
     )
 
 
-def _hlg_filter_chain(width: int, height: int) -> str:
-    """SDR (BT.709) → HLG (BT.2020 / arib-std-b67) upscale to target 4K portrait.
+def _sdr_filter_chain(width: int, height: int) -> str:
+    """Simple SDR scale — used for Mirage upload intermediate."""
+    return f"{_scale_filter(width, height)},format=yuv420p"
 
-    Matches Mirage Captions reference (HLG, not PQ). No tonemap=hable — that
-    operator is HDR→SDR and would corrupt an SDR→HDR workflow.
+
+def _upscale_hlg_filter_chain(width: int, height: int) -> str:
+    """Upscale to target resolution and convert SDR (BT.709) → HLG (BT.2020 / arib-std-b67).
+
+    Applied AFTER Mirage returns the captioned video, so zscale runs only once.
+    The Mirage output is treated as BT.709 SDR regardless of what tags it carries.
     """
     scale = _scale_filter(width, height)
     return (
@@ -102,54 +107,38 @@ def _hlg_filter_chain(width: int, height: int) -> str:
     )
 
 
-def _sdr_filter_chain(width: int, height: int) -> str:
-    return f"{_scale_filter(width, height)},format=yuv420p"
-
-
-def _video_encode_args(*, enable_hdr: bool, crf: int) -> list[str]:
-    if enable_hdr:
-        x265_params = (
-            "repeat-headers=1:"
-            "colorprim=bt2020:"
-            "transfer=arib-std-b67:"
-            "colormatrix=bt2020nc:"
-            "range=limited"
-        )
-        return [
-            "-c:v",
-            "libx265",
-            "-pix_fmt",
-            "yuv420p10le",
-            "-crf",
-            str(crf),
-            "-preset",
-            "medium",
-            "-tag:v",
-            "hvc1",
-            "-color_range",
-            "tv",
-            "-color_primaries",
-            "bt2020",
-            "-color_trc",
-            "arib-std-b67",
-            "-colorspace",
-            "bt2020nc",
-            "-movflags",
-            "+faststart",
-            "-x265-params",
-            x265_params,
-        ]
+def _hlg_encode_args(crf: int) -> list[str]:
+    """libx265 encode args for HLG 4K delivery."""
+    x265_params = (
+        "repeat-headers=1:"
+        "colorprim=bt2020:"
+        "transfer=arib-std-b67:"
+        "colormatrix=bt2020nc:"
+        "range=limited"
+    )
     return [
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-crf",
-        str(crf),
-        "-preset",
-        "medium",
-        "-movflags",
-        "+faststart",
+        "-c:v", "libx265",
+        "-pix_fmt", "yuv420p10le",
+        "-crf", str(crf),
+        "-preset", "medium",
+        "-tag:v", "hvc1",
+        "-color_range", "tv",
+        "-color_primaries", "bt2020",
+        "-color_trc", "arib-std-b67",
+        "-colorspace", "bt2020nc",
+        "-movflags", "+faststart",
+        "-x265-params", x265_params,
+    ]
+
+
+def _sdr_encode_args(crf: int) -> list[str]:
+    """libx264 encode args for SDR delivery (Mirage upload intermediate)."""
+    return [
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-crf", str(crf),
+        "-preset", "medium",
+        "-movflags", "+faststart",
     ]
 
 
@@ -171,11 +160,14 @@ def trim_and_mix(
     trim_extra_seconds: float,
     output_width: int,
     output_height: int,
-    enable_hdr: bool,
     video_crf: int,
 ) -> tuple[Path, list[str]]:
     """
-    Trim video, upscale to 4K portrait, mix audio, optionally encode HLG HDR.
+    Prepare the Mirage upload intermediate: trim, scale to 9:16 portrait, mix audio.
+
+    Output is SDR (BT.709 / yuv420p) — intentionally NO HLG conversion here.
+    HLG is applied only in remux_and_upscale, after Mirage returns the captioned video.
+    This avoids the double-zscale degradation that occurred in the previous pipeline.
 
     Returns the output path and a list of warning messages.
     """
@@ -196,17 +188,7 @@ def trim_and_mix(
     else:
         output_duration = target_duration
 
-    if enable_hdr:
-        warnings.append(
-            "HLG export from SDR source (BT.2020 / arib-std-b67) at "
-            f"{output_width}x{output_height}. True HDR requires HDR source footage."
-        )
-
-    video_filter = (
-        _hlg_filter_chain(output_width, output_height)
-        if enable_hdr
-        else _sdr_filter_chain(output_width, output_height)
-    )
+    video_filter = _sdr_filter_chain(output_width, output_height)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -222,29 +204,18 @@ def trim_and_mix(
     cmd = [
         "ffmpeg",
         "-y",
-        "-i",
-        str(video_path),
-        "-i",
-        str(voiceover_path),
-        "-stream_loop",
-        "-1",
-        "-i",
-        str(background_music_path),
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        "[v]",
-        "-map",
-        "[a]",
-        *_video_encode_args(enable_hdr=enable_hdr, crf=video_crf),
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ac",
-        "2",
-        "-t",
-        str(output_duration),
+        "-i", str(video_path),
+        "-i", str(voiceover_path),
+        "-stream_loop", "-1",
+        "-i", str(background_music_path),
+        "-filter_complex", filter_complex,
+        "-map", "[v]",
+        "-map", "[a]",
+        *_sdr_encode_args(video_crf),
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ac", "2",
+        "-t", str(output_duration),
         str(output_path),
     ]
 
@@ -252,61 +223,82 @@ def trim_and_mix(
     return output_path, warnings
 
 
-def finalize_export(
+def remux_and_upscale(
     input_path: Path,
     output_path: Path,
     *,
     output_width: int,
     output_height: int,
-    enable_hdr: bool,
     video_crf: int,
+    upscale: bool = True,
 ) -> list[str]:
     """
-    Re-encode Mirage output to guaranteed 4K portrait (+ HLG if enabled).
+    Post-Mirage finalization step.
 
-    Used because Mirage may return a lower-resolution or SDR file.
+    Two modes depending on `upscale`:
+
+    upscale=True (default):
+        Re-encodes video with libx265 to `output_width x output_height` (e.g. 2160x3840),
+        converting SDR→HLG in a single zscale pass and injecting BT.2020/arib-std-b67
+        metadata.  Audio is stream-copied (no re-encode).
+        Output will show "4K HLG" in media players and social platforms.
+
+    upscale=False:
+        Pure remux — stream-copies both video and audio, injects HLG container
+        metadata flags only.  Zero quality loss, but resolution stays as Mirage
+        returned it (typically 1080p).  Use when you do not need 4K metadata.
+
+    In both modes audio is forced to stereo AAC 192 kbps to guarantee stereo output.
     """
     ensure_ffmpeg_installed()
     warnings: list[str] = []
 
-    width, height = get_video_resolution(input_path)
-    if width == output_width and height == output_height and not enable_hdr:
-        shutil.copy2(input_path, output_path)
-        return warnings
-
-    if width != output_width or height != output_height:
-        warnings.append(
-            f"Mirage returned {width}x{height}; re-encoding to "
-            f"{output_width}x{output_height} for client delivery."
-        )
-
-    video_filter = (
-        _hlg_filter_chain(output_width, output_height)
-        if enable_hdr
-        else _sdr_filter_chain(output_width, output_height)
-    )
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-vf",
-        video_filter,
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        *_video_encode_args(enable_hdr=enable_hdr, crf=video_crf),
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ac",
-        "2",
-        str(output_path),
-    ]
+
+    if upscale:
+        src_w, src_h = get_video_resolution(input_path)
+        if src_w != output_width or src_h != output_height:
+            warnings.append(
+                f"Upscaling Mirage output {src_w}x{src_h} → "
+                f"{output_width}x{output_height} with HLG tagging."
+            )
+        video_filter = _upscale_hlg_filter_chain(output_width, output_height)
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i", str(input_path),
+            "-vf", video_filter,
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            *_hlg_encode_args(video_crf),
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ac", "2",
+            str(output_path),
+        ]
+    else:
+        warnings.append(
+            "Remux only (no upscale): stream-copying video, injecting HLG container tags."
+        )
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i", str(input_path),
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c:v", "copy",
+            "-tag:v", "hvc1",
+            "-color_range", "tv",
+            "-color_primaries", "bt2020",
+            "-color_trc", "arib-std-b67",
+            "-colorspace", "bt2020nc",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-ac", "2",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
+
     _run_ffmpeg(cmd)
     return warnings
 
