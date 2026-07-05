@@ -118,7 +118,7 @@ def _hlg_to_sdr_filter_chain(width: int, height: int) -> str:
     scale = _scale_filter(width, height)
     return (
         f"{scale},"
-        "zscale=rangein=limited:range=full:"
+        "zscale=rangein=limited:range=limited:"
         "primariesin=bt2020:primaries=bt709:"
         "matrixin=bt2020nc:matrix=bt709:"
         "transferin=arib-std-b67:transfer=bt709,"
@@ -129,14 +129,15 @@ def _hlg_to_sdr_filter_chain(width: int, height: int) -> str:
 def _upscale_hlg_filter_chain(width: int, height: int) -> str:
     """Upscale Mirage output to target resolution and restore HLG colour space.
 
-    The Mirage output is SDR BT.709 (it was converted before upload). We convert
+    The Mirage output is SDR BT.709 limited range (tv). We convert
     it back to BT.2020 HLG here in a single zscale pass, then upscale to 4K.
-    No double-conversion: zscale runs exactly once in the whole pipeline.
+    Both input and output are limited range (tv) — matching what Mirage returns
+    and what iOS expects for HLG delivery.
     """
     scale = _scale_filter(width, height)
     return (
         f"{scale},"
-        "zscale=rangein=full:range=limited:"
+        "zscale=rangein=limited:range=limited:"
         "primariesin=bt709:primaries=bt2020:"
         "matrixin=bt709:matrix=bt2020nc:"
         "transferin=bt709:transfer=arib-std-b67,"
@@ -218,20 +219,7 @@ def run_ffmpeg_with_progress(
     task_id: TaskID,
     label: str = "FFmpeg",
 ) -> None:
-    """Run an FFmpeg command while streaming stderr to update a Rich progress bar.
-
-    FFmpeg is launched with ``-progress pipe:1 -nostats`` so it writes
-    key=value pairs to stdout every second.  stderr is kept for error
-    messages only.  Both streams are read in a background thread.
-
-    Args:
-        cmd: Full FFmpeg argv (must NOT already contain -progress/-nostats).
-        duration_seconds: Expected output duration used to compute %.
-        progress: An active ``rich.Progress`` instance.
-        task_id: The task to update inside *progress*.
-        label: Short description shown in the status column.
-    """
-    # Insert -progress pipe:1 -nostats right after 'ffmpeg'
+    """Run an FFmpeg command while streaming stderr to update a Rich progress bar."""
     augmented_cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + cmd[1:]
 
     try:
@@ -253,7 +241,6 @@ def run_ffmpeg_with_progress(
     speed: str = ""
     fps: str = ""
 
-    # Read progress key=value pairs from stdout
     for line in proc.stdout:
         line = line.strip()
         if "=" not in line:
@@ -269,7 +256,6 @@ def run_ffmpeg_with_progress(
         elif key == "fps":
             fps = value
         elif key == "progress":
-            # "progress=continue" or "progress=end"
             if duration_seconds > 0:
                 pct = min(out_time_s / duration_seconds, 1.0)
                 completed = int(pct * 100)
@@ -286,7 +272,6 @@ def run_ffmpeg_with_progress(
 
     proc.wait()
 
-    # Drain stderr for error reporting
     for line in proc.stderr:
         stderr_lines.append(line)
 
@@ -322,12 +307,6 @@ def trim_and_mix(
 ) -> tuple[Path, list[str]]:
     """
     Prepare the Mirage upload intermediate: trim, scale, mix audio, convert HLG->SDR.
-
-    Source .mov files are natively BT.2020 HLG. This step converts them to
-    SDR BT.709 (yuv420p) so Mirage receives a clean, standard input.
-    HLG is restored in remux_and_upscale after Mirage returns the captioned video.
-
-    Returns the output path and a list of warning messages.
     """
     ensure_ffmpeg_installed()
     warnings: list[str] = []
@@ -352,7 +331,6 @@ def trim_and_mix(
     )
 
     video_filter = _hlg_to_sdr_filter_chain(output_width, output_height)
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     filter_complex = (
@@ -404,23 +382,12 @@ def remux_and_upscale(
     """
     Post-Mirage finalization step.
 
-    The Mirage output is SDR BT.709 (converted before upload).
-
-    upscale=True (default):
-        Upscales to output_width x output_height (e.g. 2160x3840) and converts
-        SDR BT.709 -> HLG BT.2020 in a single zscale pass. Re-encodes with
-        libx265 10-bit. Output shows "4K HLG" in media players and iOS Files.
-        iOS HDR badge is triggered by master-display + max-cll SEI metadata.
-
-    upscale=False:
-        Pure remux -- stream-copies video, injects HLG container metadata flags.
-        Zero quality loss, but resolution stays as Mirage returned it (~1080p).
-
+    upscale=True: upscale to output_width x output_height + SDR->HLG BT.2020.
+    upscale=False: pure remux, stream-copy video, inject HLG container tags only.
     Audio is always re-encoded to stereo AAC 192 kbps.
     """
     ensure_ffmpeg_installed()
     warnings: list[str] = []
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if upscale:
@@ -467,8 +434,6 @@ def remux_and_upscale(
             str(output_path),
         ]
 
-    # For remux (stream copy) we can't report frame progress meaningfully;
-    # use a simple duration-based estimate from the source file.
     duration = get_duration_seconds(input_path) if upscale else 0.0
     label = "FINALIZE" if upscale else "FINALIZE (remux)"
 
