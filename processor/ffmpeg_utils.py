@@ -116,7 +116,7 @@ def _scale_filter(width: int, height: int) -> str:
 
 
 def _hlg_passthrough_filter_chain(width: int, height: int) -> str:
-    """Scale only — no colorspace conversion.
+    """Scale only - no colorspace conversion.
 
     TEST BRANCH: sends HLG source directly to Mirage without converting to SDR.
     Output format is yuv420p (H.264 compatible) but colour metadata is NOT touched,
@@ -138,14 +138,31 @@ def _upscale_passthrough_filter_chain(width: int, height: int) -> str:
     return f"{scale},format=yuv420p10le"
 
 
+# Standard BT.2020 HLG display primaries (values x50000 per SMPTE ST 2086).
+# These SEI NAL units are required for iOS to display the HDR badge.
+_HLG_MASTER_DISPLAY = (
+    "G(13250,34500)B(7500,3000)R(34000,16000)"
+    "WP(15635,16450)L(10000000,1)"
+)
+_HLG_MAX_CLL = "1000,400"
+
+
 def _hlg_encode_args(crf: int) -> list[str]:
-    """libx265 encode args for HLG 4K delivery."""
+    """libx265 encode args for HLG 4K delivery.
+
+    Includes master-display and max-cll SEI metadata so that iOS
+    recognises the file as HDR and shows the HDR badge in Files / Photos.
+    Values are the standard BT.2020 HLG primaries (D65 white point,
+    peak luminance 1000 nits, max frame average 400 nits).
+    """
     x265_params = (
         "repeat-headers=1:"
         "colorprim=bt2020:"
         "transfer=arib-std-b67:"
         "colormatrix=bt2020nc:"
-        "range=limited"
+        "range=limited:"
+        f"master-display={_HLG_MASTER_DISPLAY}:"
+        f"max-cll={_HLG_MAX_CLL}"
     )
     return [
         "-c:v", "libx265",
@@ -221,7 +238,7 @@ def trim_and_mix(
         output_duration = target_duration
 
     warnings.append(
-        "[hlg-passthrough] Sending HLG source directly to Mirage — NO SDR conversion."
+        "[hlg-passthrough] Sending HLG source directly to Mirage - NO SDR conversion."
     )
 
     video_filter = _hlg_passthrough_filter_chain(output_width, output_height)
@@ -273,7 +290,7 @@ def remux_and_upscale(
 
     TEST BRANCH (hlg-passthrough):
     Runs probe_colorspace() first and logs what Mirage returned.
-    No zscale conversion — just scale + HLG metadata tags.
+    No zscale conversion - just scale + HLG metadata tags.
     If the output looks correct: Mirage preserved HLG and this branch
     is the right approach. If colours are wrong: use main branch.
 
@@ -301,7 +318,7 @@ def remux_and_upscale(
         src_w, src_h = get_video_resolution(input_path)
         if src_w != output_width or src_h != output_height:
             warnings.append(
-                f"Upscaling Mirage output {src_w}x{src_h} \u2192 "
+                f"Upscaling Mirage output {src_w}x{src_h} -> "
                 f"{output_width}x{output_height} (scale + HLG tags, no zscale)."
             )
         video_filter = _upscale_passthrough_filter_chain(output_width, output_height)
