@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -115,6 +114,56 @@ def probe_colorspace(video_path: Path) -> dict[str, str]:
     return info
 
 
+# ISO 23001-8 indices as shown by iPhone/macOS (primaries-transfer-matrix)
+_COLOR_PRIMARIES_ISO = {
+    "bt709": 1,
+    "bt2020": 9,
+}
+_COLOR_TRANSFER_ISO = {
+    "bt709": 1,
+    "smpte2084": 16,
+    "arib-std-b67": 18,
+}
+_COLOR_MATRIX_ISO = {
+    "bt709": 1,
+    "bt2020nc": 9,
+    "bt2020c": 10,
+}
+
+HLG_HEVC_METADATA_BSF = (
+    "hevc_metadata=colour_primaries=9:"
+    "transfer_characteristics=18:"
+    "matrix_coefficients=9"
+)
+
+
+def format_ios_color_tag(info: dict[str, str]) -> str:
+    """Format ffprobe colorspace as iPhone-style (primaries-transfer-matrix)."""
+    p = _COLOR_PRIMARIES_ISO.get(info.get("color_primaries", ""), "?")
+    t = _COLOR_TRANSFER_ISO.get(info.get("color_transfer", ""), "?")
+    m = _COLOR_MATRIX_ISO.get(info.get("color_space", ""), "?")
+    return f"({p}-{t}-{m})"
+
+
+def format_colorspace_line(label: str, info: dict[str, str]) -> str:
+    """Human-readable colorspace summary for pipeline warnings."""
+    tag = format_ios_color_tag(info)
+    return (
+        f"[colorspace] {label}: iOS tag {tag} — "
+        f"primaries={info.get('color_primaries', 'N/A')} "
+        f"transfer={info.get('color_transfer', 'N/A')} "
+        f"matrix={info.get('color_space', 'N/A')} "
+        f"{info.get('width', '?')}x{info.get('height', '?')}"
+    )
+
+
+def _probe_colorspace_safe(path: Path, label: str, warnings: list[str]) -> None:
+    try:
+        warnings.append(format_colorspace_line(label, probe_colorspace(path)))
+    except FFmpegError as exc:
+        warnings.append(f"[colorspace] {label}: probe failed — {exc}")
+
+
 def _scale_filter(width: int, height: int) -> str:
     return (
         f"scale={width}:{height}:flags=lanczos:"
@@ -123,34 +172,34 @@ def _scale_filter(width: int, height: int) -> str:
     )
 
 
-def _hlg_passthrough_filter_chain(width: int, height: int) -> str:
-    """Scale only — no colorspace conversion.
-
-    TEST BRANCH: sends HLG source directly to Mirage without converting to SDR.
-    """
+def _trim_filter_chain(width: int, height: int) -> str:
+    """Scale source to target resolution for Mirage upload (SDR 8-bit)."""
     scale = _scale_filter(width, height)
     return f"{scale},format=yuv420p"
 
 
-def _upscale_hlg_filter_chain(width: int, height: int) -> str:
-    """Scale Mirage output to target resolution — no pixel color conversion.
+def _sdr_to_hlg_filter_chain(width: int, height: int) -> str:
+    """Upscale Mirage SDR output and convert pixels to HLG (BT.2020 / arib-std-b67).
 
-    The pixel values coming out of Mirage are already correct (HLG values
-    passed through unchanged). We only scale and convert to yuv420p10le for
-    the libx265 main10 encoder. Color metadata (bt2020, arib-std-b67, 9-18-9)
-    is injected via _hlg_encode_args flags and x265-params — not via a
-    colorspace filter, which would alter the pixel values and distort exposure.
+    Mirage returns bt709 SDR; zscale performs the actual SDR→HLG conversion.
+    No tonemap=hable — that operator is HDR→SDR only.
     """
     scale = _scale_filter(width, height)
-    return f"{scale},format=yuv420p10le"
+    return (
+        f"{scale},"
+        "zscale=rangein=full:range=limited:"
+        "primariesin=bt709:primaries=bt2020:"
+        "matrixin=bt709:matrix=bt2020nc:"
+        "transferin=bt709:transfer=arib-std-b67,"
+        "format=yuv420p10le"
+    )
 
 
 def _hlg_encode_args(crf: int) -> list[str]:
     """libx265 encode args for HLG 4K delivery targeting (9-18-9) on iOS.
 
-    x265-params with NUMERIC values (9/18/9) forces SEI colour description
-    NAL units inside the HEVC bitstream. Container-level flags write the
-    ISO colr box that iOS AVFoundation reads for the HDR badge.
+    hevc_metadata BSF rewrites VUI colour info in the HEVC bitstream — this is
+    what iPhone reads for the HDR badge, not container flags alone.
     """
     x265_params = (
         "repeat-headers=1:"
@@ -170,6 +219,7 @@ def _hlg_encode_args(crf: int) -> list[str]:
         "-color_primaries", "bt2020",
         "-color_trc", "arib-std-b67",
         "-colorspace", "bt2020nc",
+        "-bsf:v", HLG_HEVC_METADATA_BSF,
         "-movflags", "+faststart+write_colr",
         "-x265-params", x265_params,
     ]
@@ -297,12 +347,13 @@ def trim_and_mix(
     """
     Prepare the Mirage upload intermediate: trim, scale, mix audio.
 
-    TEST BRANCH (hlg-passthrough): HLG source is NOT converted to SDR.
-    Sends HLG pixel values directly to Mirage to test whether Mirage
-    handles HLG natively.
+    Encodes SDR (libx264) for Mirage — HLG conversion happens in FINALIZE
+    after Mirage returns SDR bt709 video with captions burned in.
     """
     ensure_ffmpeg_installed()
     warnings: list[str] = []
+
+    _probe_colorspace_safe(video_path, "source .mov", warnings)
 
     voiceover_duration = get_duration_seconds(voiceover_path)
     video_duration = get_duration_seconds(video_path)
@@ -319,10 +370,10 @@ def trim_and_mix(
         output_duration = target_duration
 
     warnings.append(
-        "[hlg-passthrough] Sending HLG source directly to Mirage - NO SDR conversion."
+        "Mirage upload intermediate: SDR libx264 (HLG applied in FINALIZE after captions)."
     )
 
-    video_filter = _hlg_passthrough_filter_chain(output_width, output_height)
+    video_filter = _trim_filter_chain(output_width, output_height)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     filter_complex = (
@@ -357,7 +408,32 @@ def trim_and_mix(
     else:
         _run_ffmpeg(cmd)
 
+    _probe_colorspace_safe(output_path, "Mirage upload intermediate", warnings)
     return output_path, warnings
+
+
+def _remux_with_hlg_tags(input_path: Path, output_path: Path) -> None:
+    """Stream-copy video and force HLG VUI tags via hevc_metadata."""
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", str(input_path),
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-c:v", "copy",
+        "-bsf:v", HLG_HEVC_METADATA_BSF,
+        "-tag:v", "hvc1",
+        "-color_range", "tv",
+        "-color_primaries", "bt2020",
+        "-color_trc", "arib-std-b67",
+        "-colorspace", "bt2020nc",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ac", "2",
+        "-movflags", "+faststart+write_colr",
+        str(output_path),
+    ]
+    _run_ffmpeg(cmd)
 
 
 def remux_and_upscale(
@@ -372,38 +448,29 @@ def remux_and_upscale(
     task_id: Optional[TaskID] = None,
 ) -> list[str]:
     """
-    Post-Mirage finalization step.
-
-    TEST BRANCH (hlg-passthrough):
-    Probes colorspace of Mirage output, then upscales to target resolution.
-    NO pixel color conversion — the values coming out of Mirage are already
-    the correct HLG values. HLG metadata is injected only via encoder flags
-    and x265-params, not via zscale or any colorspace filter.
+    Post-Mirage finalization: upscale to 4K, convert SDR pixels to HLG via
+    zscale, encode libx265 main10, and force (9-18-9) VUI via hevc_metadata.
     """
     ensure_ffmpeg_installed()
     warnings: list[str] = []
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        cs = probe_colorspace(input_path)
-        warnings.append(
-            f"[hlg-passthrough] Mirage output colorspace: "
-            f"transfer={cs.get('color_transfer', 'N/A')} "
-            f"primaries={cs.get('color_primaries', 'N/A')} "
-            f"matrix={cs.get('color_space', 'N/A')} "
-            f"{cs.get('width', '?')}x{cs.get('height', '?')}"
-        )
-    except FFmpegError as exc:
-        warnings.append(f"[hlg-passthrough] Could not probe Mirage output: {exc}")
+    _probe_colorspace_safe(input_path, "Mirage download (pre-FINALIZE)", warnings)
 
     if upscale:
         src_w, src_h = get_video_resolution(input_path)
         if src_w != output_width or src_h != output_height:
             warnings.append(
-                f"Upscaling Mirage output {src_w}x{src_h} -> "
-                f"{output_width}x{output_height} + injecting HLG (9-18-9) metadata."
+                f"Upscaling {src_w}x{src_h} -> {output_width}x{output_height} "
+                f"+ zscale SDR→HLG + hevc_metadata (9-18-9)."
             )
-        video_filter = _upscale_hlg_filter_chain(output_width, output_height)
+        else:
+            warnings.append(
+                "Resolution already at target; applying zscale SDR→HLG + hevc_metadata (9-18-9)."
+            )
+
+        video_filter = _sdr_to_hlg_filter_chain(output_width, output_height)
+        duration = get_duration_seconds(input_path)
         cmd = [
             "ffmpeg",
             "-y",
@@ -417,36 +484,31 @@ def remux_and_upscale(
             "-ac", "2",
             str(output_path),
         ]
+        label = "FINALIZE"
+
+        if progress is not None and task_id is not None:
+            run_ffmpeg_with_progress(cmd, duration, progress, task_id, label=label)
+        else:
+            _run_ffmpeg(cmd)
     else:
         warnings.append(
-            "Remux only (no upscale): stream-copying video, injecting HLG container tags."
+            "Remux only: stream-copy + hevc_metadata tags (no SDR→HLG pixel conversion)."
         )
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i", str(input_path),
-            "-map", "0:v:0",
-            "-map", "0:a:0?",
-            "-c:v", "copy",
-            "-tag:v", "hvc1",
-            "-color_range", "tv",
-            "-color_primaries", "bt2020",
-            "-color_trc", "arib-std-b67",
-            "-colorspace", "bt2020nc",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-ac", "2",
-            "-movflags", "+faststart+write_colr",
-            str(output_path),
-        ]
+        _remux_with_hlg_tags(input_path, output_path)
 
-    duration = get_duration_seconds(input_path) if upscale else 0.0
-    label = "FINALIZE" if upscale else "FINALIZE (remux)"
+    _probe_colorspace_safe(output_path, "final delivery", warnings)
 
-    if progress is not None and task_id is not None:
-        run_ffmpeg_with_progress(cmd, duration, progress, task_id, label=label)
-    else:
-        _run_ffmpeg(cmd)
+    try:
+        final_tag = format_ios_color_tag(probe_colorspace(output_path))
+        if final_tag != "(9-18-9)":
+            warnings.append(
+                f"WARNING: final iOS color tag is {final_tag}, expected (9-18-9). "
+                "Check ffmpeg zimg/hevc_metadata support."
+            )
+        else:
+            warnings.append(f"Final iOS color tag verified: {final_tag}")
+    except FFmpegError as exc:
+        warnings.append(f"[colorspace] final delivery: probe failed — {exc}")
 
     return warnings
 

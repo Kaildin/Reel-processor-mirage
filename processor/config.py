@@ -29,6 +29,7 @@ class Config:
     enable_hdr: bool
     video_crf: int
     mirage_upload_crf: int
+    upscale_output: bool = True
     mirage_base_url: str = "https://api.mirage.app/v1"
 
     @property
@@ -78,5 +79,6 @@ def load_config(config_path: Path) -> Config:
         enable_hdr=bool(raw.get("enable_hdr", True)),
         video_crf=int(raw.get("video_crf", 20)),
         mirage_upload_crf=int(raw.get("mirage_upload_crf", 24)),
+        upscale_output=bool(raw.get("upscale_output", True)),
         mirage_base_url=str(raw.get("mirage_base_url", "https://api.mirage.app/v1")),
     )

@@ -151,7 +151,13 @@ def load_previous_run_log(log_path: Path) -> list[dict[str, Any]]:
     if not log_path.exists():
         return []
     with log_path.open(encoding="utf-8") as fh:
-        return json.load(fh)
+        content = fh.read().strip()
+        if not content:
+            return []
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return []
 
 
 def _timestamp() -> str:
