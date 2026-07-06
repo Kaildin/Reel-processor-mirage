@@ -29,6 +29,8 @@ class Config:
     enable_hdr: bool
     video_crf: int
     mirage_upload_crf: int
+    color_correction_gamma: float = 1.0
+    color_correction_saturation: float = 1.0
     upscale_output: bool = True
     mirage_base_url: str = "https://api.mirage.app/v1"
 
@@ -79,6 +81,8 @@ def load_config(config_path: Path) -> Config:
         enable_hdr=bool(raw.get("enable_hdr", True)),
         video_crf=int(raw.get("video_crf", 20)),
         mirage_upload_crf=int(raw.get("mirage_upload_crf", 24)),
+        color_correction_gamma=float(raw.get("color_correction_gamma", 1.0)),
+        color_correction_saturation=float(raw.get("color_correction_saturation", 1.0)),
         upscale_output=bool(raw.get("upscale_output", True)),
         mirage_base_url=str(raw.get("mirage_base_url", "https://api.mirage.app/v1")),
     )

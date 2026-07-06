@@ -467,6 +467,8 @@ def process_folder(
                     output_height=config.output_height,
                     video_crf=config.video_crf,
                     upscale=config.upscale_output,
+                    color_correction_gamma=config.color_correction_gamma,
+                    color_correction_saturation=config.color_correction_saturation,
                     progress=fin_progress,
                     task_id=fin_task,
                 )

@@ -39,10 +39,20 @@ output_width: 2160
 output_height: 3840
 
 # Upscale Mirage output to output_width x output_height and convert to HLG.
-# true  → re-encode with libx265, zscale SDR→HLG, output shows "4K HLG" in players
+# true  → re-encode with libx265, optional SDR brightness correction,
+#         zscale SDR→HLG, output shows "4K HLG" in players
 # false → remux only (stream-copy video), inject HLG container tags, no re-encode
 #         Use false if you want zero extra quality loss and don't need 4K metadata.
 upscale_output: true
+
+# Optional post-Mirage color correction applied during FINALIZE before SDR→HLG.
+# Keep both at 1.0 to disable correction.
+# Example values from screenshot analysis:
+#   gamma: 0.53
+#   saturation: 1.05
+# This is a cosmetic correction for Mirage SDR output, not true HDR recovery.
+color_correction_gamma: 1.0
+color_correction_saturation: 1.0
 
 # CRF for the final upscale+HLG encode (only used when upscale_output: true)
 # Lower = higher quality, larger file. 18 is a good starting point for 4K HEVC.

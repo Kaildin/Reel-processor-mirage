@@ -178,7 +178,24 @@ def _trim_filter_chain(width: int, height: int) -> str:
     return f"{scale},format=yuv420p"
 
 
-def _sdr_to_hlg_filter_chain(width: int, height: int) -> str:
+def _color_correction_filter(gamma: float, saturation: float) -> str:
+    """Return optional FFmpeg eq filter for post-Mirage SDR correction."""
+    gamma = max(gamma, 0.01)
+    saturation = max(saturation, 0.0)
+
+    if abs(gamma - 1.0) < 1e-6 and abs(saturation - 1.0) < 1e-6:
+        return ""
+
+    return f"eq=gamma={gamma}:saturation={saturation},"
+
+
+def _sdr_to_hlg_filter_chain(
+    width: int,
+    height: int,
+    *,
+    color_correction_gamma: float = 1.0,
+    color_correction_saturation: float = 1.0,
+) -> str:
     """Upscale Mirage SDR output and convert pixels to HLG (BT.2020 / arib-std-b67).
 
     Mirage returns bt709 SDR; zscale performs the actual SDR→HLG conversion.
@@ -187,7 +204,9 @@ def _sdr_to_hlg_filter_chain(width: int, height: int) -> str:
     scale = _scale_filter(width, height)
     return (
         f"{scale},"
-        "zscale=rangein=full:range=limited:"
+        f"{_color_correction_filter(color_correction_gamma, color_correction_saturation)}"
+        "zscale="
+        "rangein=full:range=limited:"
         "primariesin=bt709:primaries=bt2020:"
         "matrixin=bt709:matrix=bt2020nc:"
         "transferin=bt709:transfer=arib-std-b67,"
@@ -444,6 +463,8 @@ def remux_and_upscale(
     output_height: int,
     video_crf: int,
     upscale: bool = True,
+    color_correction_gamma: float = 1.0,
+    color_correction_saturation: float = 1.0,
     progress: Optional[Progress] = None,
     task_id: Optional[TaskID] = None,
 ) -> list[str]:
@@ -462,14 +483,30 @@ def remux_and_upscale(
         if src_w != output_width or src_h != output_height:
             warnings.append(
                 f"Upscaling {src_w}x{src_h} -> {output_width}x{output_height} "
-                f"+ zscale SDR→HLG + hevc_metadata (9-18-9)."
+                f"+ optional color correction + zscale SDR\u2192HLG + hevc_metadata (9-18-9)."
             )
         else:
             warnings.append(
-                "Resolution already at target; applying zscale SDR→HLG + hevc_metadata (9-18-9)."
+                "Resolution already at target; applying optional color correction "
+                "+ zscale SDR\u2192HLG + hevc_metadata (9-18-9)."
             )
 
-        video_filter = _sdr_to_hlg_filter_chain(output_width, output_height)
+        if (
+            abs(color_correction_gamma - 1.0) >= 1e-6
+            or abs(color_correction_saturation - 1.0) >= 1e-6
+        ):
+            warnings.append(
+                "Applying post-Mirage SDR correction during FINALIZE: "
+                f"gamma={color_correction_gamma:.3f}, "
+                f"saturation={color_correction_saturation:.3f}"
+            )
+
+        video_filter = _sdr_to_hlg_filter_chain(
+            output_width,
+            output_height,
+            color_correction_gamma=color_correction_gamma,
+            color_correction_saturation=color_correction_saturation,
+        )
         duration = get_duration_seconds(input_path)
         cmd = [
             "ffmpeg",
@@ -492,7 +529,7 @@ def remux_and_upscale(
             _run_ffmpeg(cmd)
     else:
         warnings.append(
-            "Remux only: stream-copy + hevc_metadata tags (no SDR→HLG pixel conversion)."
+            "Remux only: stream-copy + hevc_metadata tags (no SDR\u2192HLG pixel conversion)."
         )
         _remux_with_hlg_tags(input_path, output_path)
 
