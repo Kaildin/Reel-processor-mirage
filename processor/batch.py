@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
@@ -338,6 +339,7 @@ def process_folder(
     *,
     dry_run: bool = False,
     force: bool = False,
+    stop_after_download: bool = False,
     console: Console | None = None,
     current: int = 1,
     total: int = 1,
@@ -377,7 +379,7 @@ def process_folder(
             error=scan_result.message,
         )
 
-    if final_output.exists() and not force:
+    if final_output.exists() and not force and not stop_after_download:
         console.print("  [dim]⊘ Output already exists — skipping (use --force to overwrite)[/dim]")
         return make_entry(
             RunStatus.SKIPPED,
@@ -445,6 +447,19 @@ def process_folder(
             timings.append(t_dl)
             _download_with_progress(client, video_id, captioned_raw, console, basename)
             t_dl.finish(ok=True)
+
+            # ── Stop here if --stop-after-download was passed ─────────────────
+            if stop_after_download:
+                inspect_output = final_output.parent / f"{basename}_mirage_raw_sdr.mp4"
+                shutil.copy2(captioned_raw, inspect_output)
+                console.print()
+                console.print(_render_step_summary(timings))
+                console.print(
+                    f"  [bold yellow]⏹ Stopped after DOWNLOAD.[/bold yellow]\n"
+                    f"  SDR file saved → [cyan]{inspect_output}[/cyan]\n"
+                    f"  Run ffprobe on it, then implement the HDR overlay strategy."
+                )
+                return make_entry(RunStatus.SUCCESS, output=inspect_output)
 
             # ── Step 5: FINALIZE ──────────────────────────────────────────────
             t_fin = StepTiming(PipelineStep.FINALIZE)
@@ -537,6 +552,7 @@ def run_batch(
     only_failed: bool = False,
     folder: int | None = None,
     force: bool = False,
+    stop_after_download: bool = False,
     console: Console | None = None,
 ) -> list[RunLogEntry]:
     console = console or Console()
@@ -582,6 +598,7 @@ def run_batch(
             config,
             dry_run=dry_run,
             force=force,
+            stop_after_download=stop_after_download,
             console=console,
             current=idx,
             total=total,
