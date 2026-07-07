@@ -206,7 +206,7 @@ def _sdr_to_hlg_filter_chain(
         f"{scale},"
         f"{_color_correction_filter(color_correction_gamma, color_correction_saturation)}"
         "zscale="
-        "rangein=full:range=limited:"
+        "rangein=limited:range=limited:"
         "primariesin=bt709:primaries=bt2020:"
         "matrixin=bt709:matrix=bt2020nc:"
         "transferin=bt709:transfer=arib-std-b67,"

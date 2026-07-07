@@ -59,6 +59,11 @@ def run_cmd(
     force: bool = typer.Option(
         False, "--force", help="Overwrite existing output files"
     ),
+    # ↓ nuovo flag
+    stop_after_download: bool = typer.Option(
+        False, "--stop-after-download",
+        help="Download Mirage output (SDR) and save it, skip FINALIZE. For ffprobe inspection."
+    ),
     config_path: Path = typer.Option(
         DEFAULT_CONFIG, "--config", "-c", help="Path to config.yaml"
     ),
@@ -80,6 +85,7 @@ def run_cmd(
             only_failed=only_failed,
             folder=folder,
             force=force,
+            stop_after_download=stop_after_download,  # ← passa a batch
             console=console,
         )
     except ReelProcessorError as exc:

@@ -443,7 +443,8 @@ def process_folder(
             # ── Step 3: PROCESSING (Mirage polling) ───────────────────────────
             t_proc = StepTiming(PipelineStep.PROCESSING)
             timings.append(t_proc)
-            _poll_with_progress(client, video_id, console, basename)
+            mirage_data = _poll_with_progress(client, video_id, console, basename)  # 446 ← modifica
+            console.print(json.dumps(mirage_data, indent=2))       # 447 ← inserisci
             t_proc.finish(ok=True)
 
             # ── Step 4: DOWNLOAD ──────────────────────────────────────────────
@@ -451,6 +452,17 @@ def process_folder(
             timings.append(t_dl)
             _download_with_progress(client, video_id, captioned_raw, console, basename)
             t_dl.finish(ok=True)
+
+            # ── Stop here if requested ────────────────────────────────────────────
+            if stop_after_download:
+                # Sposta il file fuori dal tempdir prima che venga cancellato
+                inspect_output = final_output.parent / f"{basename}_mirage_raw_sdr.mp4"
+                import shutil
+                shutil.copy2(captioned_raw, inspect_output)
+                console.print(f"  [bold yellow]⏹ Stopped after download.[/bold yellow]")
+                console.print(f"  [cyan]SDR file saved →[/cyan] {inspect_output}")
+                console.print(_render_step_summary(timings))
+                return make_entry(RunStatus.SUCCESS, output=inspect_output)
 
             # ── Step 5: FINALIZE ──────────────────────────────────────────────
             t_fin = StepTiming(PipelineStep.FINALIZE)
@@ -545,6 +557,7 @@ def run_batch(
     only_failed: bool = False,
     folder: int | None = None,
     force: bool = False,
+    stop_after_download: bool = False,
     console: Console | None = None,
 ) -> list[RunLogEntry]:
     console = console or Console()
