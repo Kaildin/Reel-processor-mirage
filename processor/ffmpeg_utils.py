@@ -107,25 +107,6 @@ def _scale_filter(width: int, height: int) -> str:
     )
 
 
-def _hlg_to_sdr_filter_chain(width: int, height: int) -> str:
-    """Scale + convert HLG (BT.2020) -> SDR (BT.709) for the Mirage upload intermediate.
-
-    The raw .mov source files are natively BT.2020 HLG (confirmed via macOS Get Info).
-    Mirage expects a standard SDR input to apply captions correctly, so we convert
-    down to BT.709 here. The HLG grade is restored in remux_and_upscale after Mirage
-    returns the captioned file.
-    """
-    scale = _scale_filter(width, height)
-    return (
-        f"{scale},"
-        "zscale=rangein=limited:range=limited:"
-        "primariesin=bt2020:primaries=bt709:"
-        "matrixin=bt2020nc:matrix=bt709:"
-        "transferin=arib-std-b67:transfer=bt709,"
-        "format=yuv420p"
-    )
-
-
 def _upscale_hlg_filter_chain(width: int, height: int) -> str:
     """Upscale Mirage output to target resolution and restore HLG colour space.
 
@@ -187,7 +168,7 @@ def _hlg_encode_args(crf: int) -> list[str]:
 
 
 def _sdr_encode_args(crf: int) -> list[str]:
-    """libx264 encode args for SDR delivery (Mirage upload intermediate)."""
+    """libx264 encode args for the Mirage upload intermediate (native colour space)."""
     return [
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
@@ -306,7 +287,10 @@ def trim_and_mix(
     task_id: Optional[TaskID] = None,
 ) -> tuple[Path, list[str]]:
     """
-    Prepare the Mirage upload intermediate: trim, scale, mix audio, convert HLG->SDR.
+    Prepare the Mirage upload intermediate: trim, scale to upload resolution,
+    and mix audio. The native source colour space (HLG BT.2020) is preserved —
+    no SDR conversion is applied here since Mirage ignores input colour space
+    and always returns SDR BT.709 regardless.
     """
     ensure_ffmpeg_installed()
     warnings: list[str] = []
@@ -325,12 +309,7 @@ def trim_and_mix(
     else:
         output_duration = target_duration
 
-    warnings.append(
-        "Converting HLG source -> SDR BT.709 for Mirage upload. "
-        "HLG will be restored after captioning."
-    )
-
-    video_filter = _hlg_to_sdr_filter_chain(output_width, output_height)
+    video_filter = _scale_filter(output_width, output_height)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     filter_complex = (
