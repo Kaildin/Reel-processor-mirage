@@ -12,7 +12,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from rich.columns import Columns
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -43,7 +42,7 @@ from processor.ffmpeg_utils import (
     check_file_size_warning,
     ensure_ffmpeg_installed,
     get_duration_seconds,
-    remux_and_upscale,
+    overlay_captions_on_hlg,
     trim_and_mix,
 )
 from processor.mirage_api import MirageClient
@@ -74,7 +73,7 @@ class StepTiming:
     name: PipelineStep
     start: float = field(default_factory=time.monotonic)
     end: float | None = None
-    ok: bool | None = None  # True=success, False=failed, None=in progress
+    ok: bool | None = None
 
     def finish(self, *, ok: bool = True) -> None:
         self.end = time.monotonic()
@@ -95,20 +94,19 @@ class StepTiming:
 
 
 def _render_step_summary(timings: list[StepTiming]) -> Panel:
-    """Build a Rich Panel showing all completed/active steps with icons and times."""
     table = Table.grid(padding=(0, 2))
-    table.add_column(justify="left")   # icon + name
-    table.add_column(justify="right")  # elapsed
+    table.add_column(justify="left")
+    table.add_column(justify="right")
 
     for t in timings:
         if t.ok is True:
-            icon = "[bold green]✓[/bold green]"
+            icon = "[bold green]\u2713[/bold green]"
             name_style = "green"
         elif t.ok is False:
-            icon = "[bold red]✗[/bold red]"
+            icon = "[bold red]\u2717[/bold red]"
             name_style = "red"
         else:
-            icon = "[bold yellow]⟳[/bold yellow]"
+            icon = "[bold yellow]\u27f3[/bold yellow]"
             name_style = "yellow"
 
         table.add_row(
@@ -142,7 +140,6 @@ def output_filename(video_basename: str) -> str:
 
 
 def output_path_for(scan_result: FolderScanResult) -> Path:
-    """Final output lives inside the numbered folder, next to the source files."""
     basename = scan_result.basename or "unknown"
     folder = scan_result.video_path.parent  # type: ignore[union-attr]
     return folder / output_filename(basename)
@@ -164,7 +161,6 @@ def _timestamp() -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_step_progress() -> Progress:
-    """Progress bar for individual FFmpeg encode steps (TRIM / FINALIZE)."""
     return Progress(
         SpinnerColumn(),
         TextColumn("[bold cyan]{task.description}"),
@@ -176,7 +172,6 @@ def _make_step_progress() -> Progress:
 
 
 def _make_transfer_progress() -> Progress:
-    """Progress bar for upload / download with real byte counts."""
     return Progress(
         SpinnerColumn("bouncingBar"),
         TextColumn("[bold cyan]{task.description}"),
@@ -189,7 +184,6 @@ def _make_transfer_progress() -> Progress:
 
 
 def _make_batch_progress() -> Progress:
-    """Overall batch progress bar (1 tick per folder)."""
     return Progress(
         SpinnerColumn(),
         TextColumn("[bold white]{task.description}"),
@@ -209,9 +203,7 @@ def _upload_with_progress(
     console: Console,
     basename: str,
 ) -> str:
-    """Upload using requests-toolbelt MultipartEncoderMonitor for real byte progress."""
     file_size = intermediate.stat().st_size
-
     up_progress = _make_transfer_progress()
     task = up_progress.add_task(f"UPLOAD  {basename}", total=file_size)
 
@@ -220,7 +212,7 @@ def _upload_with_progress(
 
     with Live(up_progress, console=console, refresh_per_second=15):
         video_id = client.upload_for_captions(intermediate, progress_callback=_on_progress)
-        up_progress.update(task, completed=file_size, description=f"UPLOAD  {basename}  ✓")
+        up_progress.update(task, completed=file_size, description=f"UPLOAD  {basename}  \u2713")
 
     return video_id
 
@@ -236,9 +228,7 @@ def _download_with_progress(
     console: Console,
     basename: str,
 ) -> None:
-    """Download the captioned video with a real byte-progress bar."""
     dl_progress = _make_transfer_progress()
-    # total=-1 means unknown; Rich will show indeterminate bar until we know
     task = dl_progress.add_task(f"DOWNLOAD  {basename}", total=None)
 
     def _on_progress(received: int, total: int) -> None:
@@ -248,20 +238,19 @@ def _download_with_progress(
 
     with Live(dl_progress, console=console, refresh_per_second=15):
         client.download_video(video_id, output_path, progress_callback=_on_progress)
-        dl_progress.update(task, description=f"DOWNLOAD  {basename}  ✓")
+        dl_progress.update(task, description=f"DOWNLOAD  {basename}  \u2713")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Mirage polling helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Map Mirage status strings to human-friendly descriptions
 _MIRAGE_STATUS_LABEL: dict[str, str] = {
-    "QUEUED":     "queued — waiting for a worker",
-    "PROCESSING": "processing captions…",
-    "COMPLETE":   "complete ✓",
-    "FAILED":     "failed ✗",
-    "CANCELLED":  "cancelled ✗",
+    "QUEUED":     "queued \u2014 waiting for a worker",
+    "PROCESSING": "processing captions\u2026",
+    "COMPLETE":   "complete \u2713",
+    "FAILED":     "failed \u2717",
+    "CANCELLED":  "cancelled \u2717",
 }
 
 
@@ -271,7 +260,6 @@ def _poll_with_progress(
     console: Console,
     basename: str,
 ) -> dict[str, Any]:
-    """Poll Mirage and show a live spinner with status text + attempt counter."""
     interval = client._config.poll_interval_seconds
     max_attempts = client._config.max_poll_attempts
 
@@ -282,7 +270,7 @@ def _poll_with_progress(
         transient=False,
     )
     task = poll_progress.add_task(
-        f"PROCESSING  {basename}  —  attempt 1/{max_attempts}",
+        f"PROCESSING  {basename}  \u2014  attempt 1/{max_attempts}",
         total=None,
     )
 
@@ -295,7 +283,7 @@ def _poll_with_progress(
             poll_progress.update(
                 task,
                 description=(
-                    f"PROCESSING  {basename}  —  "
+                    f"PROCESSING  {basename}  \u2014  "
                     f"{label}  "
                     f"[dim](attempt {attempt}/{max_attempts}, "
                     f"poll every {interval}s)[/dim]"
@@ -305,7 +293,7 @@ def _poll_with_progress(
             if raw_status == "COMPLETE":
                 poll_progress.update(
                     task,
-                    description=f"PROCESSING  {basename}  —  [bold green]complete ✓[/bold green]",
+                    description=f"PROCESSING  {basename}  \u2014  [bold green]complete \u2713[/bold green]",
                 )
                 return data
 
@@ -319,7 +307,6 @@ def _poll_with_progress(
                 )
 
             if attempt < max_attempts:
-                # Count down in small increments so the spinner stays alive
                 for _ in range(int(interval * 5)):
                     time.sleep(0.2)
 
@@ -348,6 +335,7 @@ def process_folder(
     folder_number = scan_result.folder_number
     basename = scan_result.basename or "unknown"
     final_output = output_path_for(scan_result)
+    source_hlg = scan_result.video_path  # original .mov, never deleted
 
     header = f"[bold]Folder {folder_number}/{total}[/bold]  {basename}"
     console.rule(header)
@@ -372,7 +360,7 @@ def process_folder(
         )
 
     if not scan_result.is_processable:
-        console.print(f"  [dim]⊘ Skipped ({scan_result.status.value}): {scan_result.message}[/dim]")
+        console.print(f"  [dim]\u2298 Skipped ({scan_result.status.value}): {scan_result.message}[/dim]")
         return make_entry(
             RunStatus.SKIPPED,
             skip_reason=scan_result.status.value,
@@ -380,7 +368,7 @@ def process_folder(
         )
 
     if final_output.exists() and not force and not stop_after_download:
-        console.print("  [dim]⊘ Output already exists — skipping (use --force to overwrite)[/dim]")
+        console.print("  [dim]\u2298 Output already exists \u2014 skipping (use --force to overwrite)[/dim]")
         return make_entry(
             RunStatus.SKIPPED,
             skip_reason="output_exists",
@@ -388,7 +376,7 @@ def process_folder(
         )
 
     if dry_run:
-        console.print("  [dim]dry-run: TRIM ✓ | UPLOAD ✓ | PROCESSING … | DOWNLOAD ✓ | FINALIZE ✓[/dim]")
+        console.print("  [dim]dry-run: TRIM \u2713 | UPLOAD \u2713 | PROCESSING \u2026 | DOWNLOAD \u2713 | FINALIZE \u2713[/dim]")
         return make_entry(RunStatus.SUCCESS, output=final_output)
 
     try:
@@ -404,7 +392,7 @@ def process_folder(
             timings.append(t_trim)
 
             trim_progress = _make_step_progress()
-            trim_task = trim_progress.add_task("TRIM  preparing…", total=100)
+            trim_task = trim_progress.add_task("TRIM  preparing\u2026", total=100)
 
             with Live(trim_progress, console=console, refresh_per_second=15):
                 _, trim_warnings = trim_and_mix(
@@ -424,11 +412,11 @@ def process_folder(
             t_trim.finish(ok=True)
 
             for warning in trim_warnings:
-                console.print(f"  [yellow]⚠  {warning}[/yellow]")
+                console.print(f"  [yellow]\u26a0  {warning}[/yellow]")
 
             size_warning = check_file_size_warning(intermediate, config.max_file_size_mb)
             if size_warning:
-                console.print(f"  [yellow]⚠  {size_warning}[/yellow]")
+                console.print(f"  [yellow]\u26a0  {size_warning}[/yellow]")
 
             # ── Step 2: UPLOAD ────────────────────────────────────────────────
             t_upload = StepTiming(PipelineStep.UPLOAD)
@@ -455,39 +443,38 @@ def process_folder(
                 console.print()
                 console.print(_render_step_summary(timings))
                 console.print(
-                    f"  [bold yellow]⏹ Stopped after DOWNLOAD.[/bold yellow]\n"
-                    f"  SDR file saved → [cyan]{inspect_output}[/cyan]\n"
+                    f"  [bold yellow]\u23f9 Stopped after DOWNLOAD.[/bold yellow]\n"
+                    f"  SDR file saved \u2192 [cyan]{inspect_output}[/cyan]\n"
                     f"  Run ffprobe on it, then implement the HDR overlay strategy."
                 )
                 return make_entry(RunStatus.SUCCESS, output=inspect_output)
 
-            # ── Step 5: FINALIZE ──────────────────────────────────────────────
+            # ── Step 5: FINALIZE (overlay captions on native HLG) ─────────────
             t_fin = StepTiming(PipelineStep.FINALIZE)
             timings.append(t_fin)
 
             fin_progress = _make_step_progress()
-            fin_task = fin_progress.add_task("FINALIZE  preparing…", total=100)
+            fin_task = fin_progress.add_task("FINALIZE  preparing\u2026", total=100)
 
             with Live(fin_progress, console=console, refresh_per_second=15):
-                finalize_warnings = remux_and_upscale(
+                finalize_warnings = overlay_captions_on_hlg(
                     captioned_raw,
+                    source_hlg,  # type: ignore[arg-type]
                     final_output,
                     output_width=config.output_width,
                     output_height=config.output_height,
                     video_crf=config.video_crf,
-                    upscale=config.upscale_output,
                     progress=fin_progress,
                     task_id=fin_task,
                 )
             t_fin.finish(ok=True)
 
             for warning in finalize_warnings:
-                console.print(f"  [yellow]⚠  {warning}[/yellow]")
+                console.print(f"  [yellow]\u26a0  {warning}[/yellow]")
 
-            # ── Summary panel ─────────────────────────────────────────────────
             console.print()
             console.print(_render_step_summary(timings))
-            console.print(f"  [bold green]✓ Done →[/bold green] {final_output}")
+            console.print(f"  [bold green]\u2713 Done \u2192[/bold green] {final_output}")
             return make_entry(RunStatus.SUCCESS, output=final_output)
 
     except MirageJobFailedError as exc:
@@ -495,7 +482,7 @@ def process_folder(
             timings[-1].finish(ok=False)
         console.print()
         console.print(_render_step_summary(timings))
-        console.print(f"  [bold red]✗ PROCESSING failed:[/bold red] {exc}")
+        console.print(f"  [bold red]\u2717 PROCESSING failed:[/bold red] {exc}")
         error = f"{exc.status}"
         if exc.error_code:
             error += f" [{exc.error_code}]"
@@ -508,7 +495,7 @@ def process_folder(
             timings[-1].finish(ok=False)
         console.print()
         console.print(_render_step_summary(timings))
-        console.print(f"  [bold red]✗ Mirage error:[/bold red] {exc}")
+        console.print(f"  [bold red]\u2717 Mirage error:[/bold red] {exc}")
         return make_entry(RunStatus.FAILED, error=str(exc))
 
     except FFmpegError as exc:
@@ -516,7 +503,7 @@ def process_folder(
             timings[-1].finish(ok=False)
         console.print()
         console.print(_render_step_summary(timings))
-        console.print(f"  [bold red]✗ FFmpeg error:[/bold red] {exc}")
+        console.print(f"  [bold red]\u2717 FFmpeg error:[/bold red] {exc}")
         return make_entry(RunStatus.FAILED, error=str(exc))
 
     except ReelProcessorError as exc:
@@ -524,7 +511,7 @@ def process_folder(
             timings[-1].finish(ok=False)
         console.print()
         console.print(_render_step_summary(timings))
-        console.print(f"  [bold red]✗ Error:[/bold red] {exc}")
+        console.print(f"  [bold red]\u2717 Error:[/bold red] {exc}")
         return make_entry(RunStatus.FAILED, error=str(exc))
 
 
@@ -574,21 +561,16 @@ def run_batch(
             if _should_process_only_failed(result.folder_number, out, previous_log):
                 filtered.append(result)
         processable = filtered
-        console.print(
-            f"[bold]Re-running {len(processable)} failed/pending folders[/bold]"
-        )
+        console.print(f"[bold]Re-running {len(processable)} failed/pending folders[/bold]")
 
     total = len(processable)
 
-    # ── Overall batch progress bar ────────────────────────────────────────────
     batch_progress = _make_batch_progress()
-    batch_task = batch_progress.add_task(
-        f"[white]Batch ({total} folders)", total=total
-    )
+    batch_task = batch_progress.add_task(f"[white]Batch ({total} folders)", total=total)
 
     console.print()
     with Live(batch_progress, console=console, refresh_per_second=4):
-        pass  # render once so the bar appears before folder processing starts
+        pass
 
     entries: list[RunLogEntry] = []
 
@@ -625,7 +607,7 @@ def run_batch(
         json.dump(merged_log, fh, indent=2, ensure_ascii=False)
 
     success = sum(1 for e in entries if e.status == RunStatus.SUCCESS)
-    failed = sum(1 for e in entries if e.status == RunStatus.FAILED)
+    failed  = sum(1 for e in entries if e.status == RunStatus.FAILED)
     skipped = sum(1 for e in entries if e.status == RunStatus.SKIPPED)
 
     console.print()
@@ -635,6 +617,6 @@ def run_batch(
         f"[bold red]{failed} failed[/bold red]  "
         f"[bold yellow]{skipped} skipped[/bold yellow]"
     )
-    console.print(f"  Run log → [cyan]{log_path}[/cyan]")
+    console.print(f"  Run log \u2192 [cyan]{log_path}[/cyan]")
 
     return entries
