@@ -318,15 +318,27 @@ def _build_clean_sdr_reference(
     """
     ref_path = Path(tmp_dir) / "_clean_sdr_ref.mp4"
     scale = _scale_filter(ref_width, ref_height)
+    # Explicitly convert HLG source to SDR BT.709 when building reference.
+    # This ensures the clean reference is in the same colourspace as Mirage's
+    # SDR output (bt709), preventing chroma mismatches during difference.
+    vf = (
+        f"trim=0:{duration},setpts=PTS-STARTPTS,{scale},"
+        "zscale=primariesin=bt2020:primaries=bt709:"
+        "transferin=arib-std-b67:transfer=bt709:"
+        "matrixin=bt2020nc:matrix=bt709,format=yuv420p"
+    )
     cmd = [
         "ffmpeg", "-y",
         "-i", str(source_hlg),
-        "-vf", f"trim=0:{duration},setpts=PTS-STARTPTS,{scale}",
+        "-vf", vf,
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-crf", "18",
         "-preset", "ultrafast",
         "-an",
+        "-color_primaries", "bt709",
+        "-color_trc", "bt709",
+        "-colorspace", "bt709",
         str(ref_path),
     ]
     _run_ffmpeg(cmd)
