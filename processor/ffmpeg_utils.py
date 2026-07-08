@@ -411,9 +411,15 @@ def overlay_captions_on_hlg(
         # [1][2] -> blend(difference) -> [diff]
         #   Black where no captions, non-zero where Mirage drew pixels.
         #
-        # [diff] -> zscale(bt709->arib-std-b67) -> format(yuv420p10le) -> [diff_hlg]
-        #   Remap SDR luminance to HLG: caption whites become HLG-bright whites.
+        # [diff] -> colorspace(bt709) -> zscale(bt709->arib-std-b67)
+        #           -> format(yuv420p10le) -> [diff_hlg]
+        #   Step 1: Ensure we're in BT.709 color space (RGB aware conversion).
+        #   Step 2: Remap SDR luminance to HLG using full color conversion.
+        #   Caption whites become HLG-bright whites.
         #   The black (zero) areas stay zero — adding them changes nothing.
+        #   NOTE: Without colorspace step first, zscale can misinterpret RGB values
+        #   causing color distortion (e.g., magenta/violet output). The colorspace
+        #   filter ensures proper RGB->YUV->RGB conversion during primaries remap.
         #
         # [0:v] -> scale 4K -> [hlg4k]
         #   Native HLG source upscaled, colours untouched.
@@ -437,7 +443,11 @@ def overlay_captions_on_hlg(
             # Step A: isolate caption pixels
             "[1:v][2:v]blend=all_mode=difference[diff];"
             # Step B: remap caption luminance SDR -> HLG
+            # Convert the caption mask from BT.709 to BT.2020+HLG using zscale.
+            # First ensure the pixel format is YUV before conversion to avoid
+            # RGB value misinterpretation that causes magenta/violet artifacts.
             "[diff]"
+            "scale=width=-1:height=-1:out_color_matrix=bt709,"
             "zscale=rangein=limited:range=limited:"
             "primariesin=bt709:primaries=bt2020:"
             "matrixin=bt709:matrix=bt2020nc:"
