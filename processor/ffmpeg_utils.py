@@ -440,11 +440,10 @@ def overlay_captions_on_hlg(
         filter_complex = (
             # Step A: isolate caption pixels (difference mask)
             "[1:v][2:v]blend=all_mode=difference[diff];"
-            # Step B: Extract ONLY the luminance from the diff mask.
-            # Use lutrgb=g=g:r=g:b=g to force all channels to green (luma equivalent).
-            # This desaturates the mask to pure grayscale, eliminating magenta/violet
-            # artifacts that occur when remapping chrominance between color spaces.
-            "[diff]lutrgb=r=0.3*r+0.59*g+0.11*b:g=0.3*r+0.59*g+0.11*b:b=0.3*r+0.59*g+0.11*b[diff_gray];"
+            # Step B: Desaturate the diff mask to pure grayscale (luminance only).
+            # This eliminates magenta/violet color artifacts that occur when
+            # the colored mask is added to the HLG source. We only need brightness.
+            "[diff]hue=s=0[diff_gray];"
             # Step C: Scale to output resolution
             f"[0:v]{scale_src}[hlg4k];"
             f"[diff_gray]{scale_mask}[mask4k];"
