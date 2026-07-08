@@ -1,4 +1,4 @@
-# reel-processor
+# reel-processor-mirage
 
 CLI Python per processare in batch reel di esercizi di fisioterapia: trim video, mix audio (voiceover + musica di sottofondo) e aggiunta sottotitoli animati tramite l'API Mirage.
 
@@ -16,7 +16,7 @@ brew install ffmpeg
 ## Installazione
 
 ```bash
-cd reel-processor
+cd reel-processor-mirage
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -43,9 +43,10 @@ Copia `config.yaml.example` in `config.yaml` e compila tutti i campi obbligatori
 | `max_file_size_mb` | Soglia MB per warning upload Mirage (default: `50`) |
 | `output_width` | Larghezza export finale in pixel (default: `2160` = 4K verticale) |
 | `output_height` | Altezza export finale in pixel (default: `3840` = 4K verticale 9:16) |
-| `enable_hdr` | Export finale in HLG HDR HEVC 10-bit (default: `true`) |
-| `video_crf` | Qualità export finale — più basso = migliore (default: `20`) |
+| `upscale_output` | `true` → re-encode 4K HLG HEVC; `false` → remux-only con tag HLG, nessun re-encode (default: `true`) |
+| `video_crf` | Qualità encode finale (solo se `upscale_output: true`) — più basso = migliore (default: `18`) |
 | `mirage_upload_crf` | Qualità file inviato a Mirage (default: `24`) |
+| `mirage_base_url` | Base URL API Mirage (opzionale, cambia solo per ambienti diversi) |
 
 ### Ottenere la Mirage API key
 
@@ -130,6 +131,15 @@ python main.py run --force
 python main.py run --folder 42 --force
 ```
 
+### Download Mirage SDR e stop (senza finalizzazione)
+
+Scarica l'output SDR di Mirage e lo salva, poi si ferma senza eseguire il passaggio di finalizzazione. Utile per ispezionare il file con `ffprobe` prima di implementare l'overlay HDR.
+
+```bash
+python main.py run --stop-after-download
+python main.py run --folder 42 --stop-after-download
+```
+
 ### Lista template Mirage
 
 ```bash
@@ -162,12 +172,14 @@ Status possibili: `success`, `failed`, `skipped`.
 
 ## Export 4K + HLG HDR
 
-Il video finale viene esportato in **4K verticale (2160×3840, 9:16)** con **HLG** (HEVC 10-bit, BT.2020, arib-std-b67), allineato al riferimento Mirage Captions.
+Il video finale viene esportato in **4K verticale (2160×3840, 9:16)** con **HLG** (HEVC 10-bit, BT.2020, arib-std-b67).
 
-La pipeline ha due passaggi di encoding:
+Il comportamento dipende da `upscale_output` nel `config.yaml`:
 
-1. **Intermedio per Mirage** — 4K/HLG con `mirage_upload_crf` (default `24`)
-2. **Export finale per il cliente** — dopo i sottotitoli Mirage, re-encode a 4K/HLG con `video_crf` (default `20`)
+| Modalità | `upscale_output` | Comportamento |
+|----------|-----------------|---------------|
+| Re-encode | `true` (default) | Upscale + encode HLG via `libx265` e `zscale`. Usa `video_crf` (default `18`). |
+| Remux-only | `false` | Stream-copy video, inietta solo tag HLG nel container. Nessuna perdita di qualità aggiuntiva. |
 
 > **Nota:** i file sorgente `.mov` sono tipicamente SDR (BT.709). La conversione a HLG avviene via `zscale` senza `tonemap=hable` (inappropriato per SDR→HDR). Per HDR nativo servirebbe footage sorgente già in HDR.
 
@@ -175,15 +187,31 @@ Se i file superano il limite upload Mirage, alza `mirage_upload_crf` (es. `28` o
 
 ## Pipeline per ogni cartella
 
-1. **FFmpeg** — legge durata voiceover `.m4a`, taglia `.mov`, upscale 4K (2160×3840), mix audio stereo, encode HLG per upload Mirage
+1. **FFmpeg** — legge durata voiceover `.m4a`, taglia `.mov`, upscale 4K (2160×3840), mix audio stereo, encode SDR per upload Mirage (`mirage_upload_crf`)
 2. **Mirage API** — upload intermedio, poll fino a `COMPLETE`, download video con sottotitoli
-3. **Finalizzazione** — re-encode 4K HLG stereo per consegna cliente
+3. **Finalizzazione** — in base a `upscale_output`: re-encode 4K HLG oppure remux-only con tag HLG
 4. **Salvataggio** — file finale in `_output/`
 
 Progresso in console:
 
 ```
 [42/344] squat → TRIM ✓ | UPLOAD ✓ | PROCESSING... | COMPLETE ✓
+```
+
+## Struttura del progetto
+
+```
+reel-processor-mirage/
+├── main.py                  # Entrypoint CLI (Typer)
+├── config.yaml.example      # Template configurazione
+├── requirements.txt
+└── processor/
+    ├── batch.py             # Orchestrazione batch
+    ├── config.py            # Caricamento e validazione config
+    ├── exceptions.py        # Eccezioni custom
+    ├── ffmpeg_utils.py      # Wrapper FFmpeg/ffprobe
+    ├── mirage_api.py        # Client API Mirage
+    └── scanner.py           # Scansione cartelle input
 ```
 
 ## Gestione errori
