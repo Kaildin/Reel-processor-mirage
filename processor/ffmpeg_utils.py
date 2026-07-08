@@ -414,32 +414,31 @@ def overlay_captions_on_hlg(
         )
 
         # Inputs:
-        #  [0] = source HLG .mov
-        #  [1] = Mirage captioned SDR
-        #  [2] = clean SDR reference
+        #  [0] = source HLG .mov (BT.2020)
+        #  [1] = Mirage captioned SDR (BT.709)
+        #  [2] = clean SDR reference (converted to BT.709)
         #
         # filter_complex breakdown:
         #
         # [1][2] -> blend(difference) -> [diff]
-        #   Isolates caption pixels by showing where Mirage SDR differs from clean ref.
-        #   Result has both Y and UV components in SDR YUV space.
+        #   Isolates caption pixels. Result is in SDR YUV (BT.709 colorspace).
         #
-        # [diff] -> lutrgb (desaturate to grayscale) -> [diff_gray]
-        #   CRITICAL FIX: The diff mask had color artifacts from YUV blending.
-        #   When converted between color spaces (BT.709→BT.2020), the chrominance
-        #   gets misinterpreted causing magenta/violet output.
-        #   Solution: Desaturate to pure luma (grayscale) so only luminance is used.
-        #   This way, blend(addition) adds brightness without color distortion.
+        # [diff] -> zscale(bt709->bt2020) + format(yuv420p10le) -> [diff_hlg]
+        #   CRITICAL: Convert caption mask colorspace to match HLG source.
+        #   Both [0:v] and [diff_hlg] must be BT.2020 BEFORE blend(addition).
+        #   WITHOUT this conversion, FFmpeg tries to add YUV from different primaries
+        #   which produces magenta/violet artifacts (chroma misalignment).
         #
         # [0:v] -> scale 4K -> [hlg4k]
-        #   Native HLG source upscaled, colours untouched.
+        #   Native HLG source upscaled (stays BT.2020).
         #
-        # [diff_gray] -> scale 4K -> [mask4k]
-        #   Grayscale mask upscaled to match.
+        # [diff_hlg] -> scale 4K -> [mask4k]
+        #   Caption mask upscaled in matching BT.2020 colorspace.
         #
         # [hlg4k][mask4k] -> blend(addition) -> [out]
-        #   Add caption brightness onto native HLG. Non-caption areas: x+0=x (no change).
-        #   Caption areas: native_hlg_pixel + mask_luma (brightens caption pixels).
+        #   Both inputs now in same colorspace (BT.2020), safe to blend.
+        #   Add caption brightness onto native HLG: x+0=x where no captions,
+        #   x+caption where captions exist.
         #
         # Note on blend(addition) clipping:
         #   In 10-bit limited range the max value is 940. If native pixel + caption
@@ -452,15 +451,19 @@ def overlay_captions_on_hlg(
         filter_complex = (
             # Step A: isolate caption pixels (difference mask)
             "[1:v][2:v]blend=all_mode=difference[diff];"
-            # Step B: Desaturate the diff mask to pure grayscale (luminance only).
-            # This eliminates magenta/violet color artifacts that occur when
-            # the colored mask is added to the HLG source. We only need brightness.
-            "[diff]hue=s=0[diff_gray];"
-            # Step C: Scale to output resolution
+            # Step B: Convert caption mask from BT.709 (SDR) to BT.2020 (HLG)
+            # This is CRITICAL: both inputs to blend(addition) must be same colorspace!
+            # Use zscale to remap primaries, then format to 10-bit to match HLG source.
+            "[diff]"
+            "zscale=rangein=limited:range=limited:"
+            "primariesin=bt709:primaries=bt2020:"
+            "matrixin=bt709:matrix=bt2020nc:"
+            "transferin=bt709:transfer=arib-std-b67,"
+            "format=yuv420p10le[diff_hlg];"
+            # Step C: Scale both to output resolution in matching colorspace
             f"[0:v]{scale_src}[hlg4k];"
-            f"[diff_gray]{scale_mask}[mask4k];"
-            # Step D: add caption pixels onto native HLG
-            # The grayscale mask can now be added directly without color shift.
+            f"[diff_hlg]{scale_mask}[mask4k];"
+            # Step D: Add caption pixels onto native HLG (both now BT.2020)
             "[hlg4k][mask4k]blend=all_mode=addition[out]"
         )
 
