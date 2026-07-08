@@ -409,27 +409,25 @@ def overlay_captions_on_hlg(
         # filter_complex breakdown:
         #
         # [1][2] -> blend(difference) -> [diff]
-        #   Black where no captions, non-zero where Mirage drew pixels.
+        #   Isolates caption pixels by showing where Mirage SDR differs from clean ref.
+        #   Result has both Y and UV components in SDR YUV space.
         #
-        # [diff] -> colorspace(bt709) -> zscale(bt709->arib-std-b67)
-        #           -> format(yuv420p10le) -> [diff_hlg]
-        #   Step 1: Ensure we're in BT.709 color space (RGB aware conversion).
-        #   Step 2: Remap SDR luminance to HLG using full color conversion.
-        #   Caption whites become HLG-bright whites.
-        #   The black (zero) areas stay zero — adding them changes nothing.
-        #   NOTE: Without colorspace step first, zscale can misinterpret RGB values
-        #   causing color distortion (e.g., magenta/violet output). The colorspace
-        #   filter ensures proper RGB->YUV->RGB conversion during primaries remap.
+        # [diff] -> lutrgb (desaturate to grayscale) -> [diff_gray]
+        #   CRITICAL FIX: The diff mask had color artifacts from YUV blending.
+        #   When converted between color spaces (BT.709→BT.2020), the chrominance
+        #   gets misinterpreted causing magenta/violet output.
+        #   Solution: Desaturate to pure luma (grayscale) so only luminance is used.
+        #   This way, blend(addition) adds brightness without color distortion.
         #
         # [0:v] -> scale 4K -> [hlg4k]
         #   Native HLG source upscaled, colours untouched.
         #
-        # [diff_hlg] -> scale 4K -> [mask4k]
-        #   Caption mask upscaled to match.
+        # [diff_gray] -> scale 4K -> [mask4k]
+        #   Grayscale mask upscaled to match.
         #
         # [hlg4k][mask4k] -> blend(addition) -> [out]
-        #   Add caption pixels onto native HLG. Non-caption areas: x+0=x (no change).
-        #   Caption areas: native_hlg_pixel + caption_hlg_pixel (bright on bright).
+        #   Add caption brightness onto native HLG. Non-caption areas: x+0=x (no change).
+        #   Caption areas: native_hlg_pixel + mask_luma (brightens caption pixels).
         #
         # Note on blend(addition) clipping:
         #   In 10-bit limited range the max value is 940. If native pixel + caption
@@ -440,23 +438,18 @@ def overlay_captions_on_hlg(
         scale_mask = _scale_filter(output_width, output_height)
 
         filter_complex = (
-            # Step A: isolate caption pixels
+            # Step A: isolate caption pixels (difference mask)
             "[1:v][2:v]blend=all_mode=difference[diff];"
-            # Step B: remap caption luminance SDR -> HLG
-            # Convert the caption mask from BT.709 to BT.2020+HLG using zscale.
-            # First ensure the pixel format is YUV before conversion to avoid
-            # RGB value misinterpretation that causes magenta/violet artifacts.
-            "[diff]"
-            "scale=width=-1:height=-1:out_color_matrix=bt709,"
-            "zscale=rangein=limited:range=limited:"
-            "primariesin=bt709:primaries=bt2020:"
-            "matrixin=bt709:matrix=bt2020nc:"
-            "transferin=bt709:transfer=arib-std-b67,"
-            "format=yuv420p10le[diff_hlg];"
-            # Step C: scale both to output resolution
+            # Step B: Extract ONLY the luminance from the diff mask.
+            # Use lutrgb=g=g:r=g:b=g to force all channels to green (luma equivalent).
+            # This desaturates the mask to pure grayscale, eliminating magenta/violet
+            # artifacts that occur when remapping chrominance between color spaces.
+            "[diff]lutrgb=r=0.3*r+0.59*g+0.11*b:g=0.3*r+0.59*g+0.11*b:b=0.3*r+0.59*g+0.11*b[diff_gray];"
+            # Step C: Scale to output resolution
             f"[0:v]{scale_src}[hlg4k];"
-            f"[diff_hlg]{scale_mask}[mask4k];"
+            f"[diff_gray]{scale_mask}[mask4k];"
             # Step D: add caption pixels onto native HLG
+            # The grayscale mask can now be added directly without color shift.
             "[hlg4k][mask4k]blend=all_mode=addition[out]"
         )
 
