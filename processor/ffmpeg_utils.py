@@ -83,6 +83,48 @@ def get_file_size_mb(file_path: Path) -> float:
     return file_path.stat().st_size / (1024 * 1024)
 
 
+def get_video_color_info(video_path: Path) -> str:
+    """Run ffprobe to return key video stream color metadata as a short string.
+
+    Returns a single-line string like:
+      "1920x1080 yuv420p bt709 bt709 bt709"
+    (widthxheight, pix_fmt, color_primaries, color_trc, color_space)
+    """
+    ensure_ffmpeg_installed()
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,pix_fmt,color_primaries,color_trc,color_space",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise FFmpegError(f"ffprobe failed for {video_path}: {exc.stderr.strip()}") from exc
+    # ffprobe will print 5 lines (width, height, pix_fmt, color_primaries, color_trc, color_space)
+    lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+    if not lines:
+        return "(no video stream)"
+    # Prefer concise single-line summary
+    # First two lines might be width and height or combined 'widthxheight' depending on ffprobe call
+    if len(lines) >= 6:
+        width = lines[0]
+        height = lines[1]
+        pix_fmt = lines[2]
+        prim = lines[3]
+        trc = lines[4]
+        space = lines[5]
+        return f"{width}x{height} {pix_fmt} {prim} {trc} {space}"
+    elif len(lines) == 5:
+        # width and height were combined into one 'wxh' line
+        wh = lines[0]
+        pix_fmt, prim, trc, space = lines[1:]
+        return f"{wh} {pix_fmt} {prim} {trc} {space}"
+    else:
+        return " ".join(lines)
+
+
 def _scale_filter(width: int, height: int) -> str:
     return (
         f"scale={width}:{height}:flags=lanczos:"
@@ -393,10 +435,21 @@ def overlay_captions_on_hlg(
     duration = get_duration_seconds(captioned_sdr)
     src_w, src_h = get_video_resolution(captioned_sdr)
 
+    # Run ffprobe on the inputs so we can log exact pixel/color metadata
+    try:
+        cap_info = get_video_color_info(captioned_sdr)
+    except FFmpegError:
+        cap_info = "(ffprobe failed)"
+    try:
+        src_info = get_video_color_info(source_hlg)
+    except FFmpegError:
+        src_info = "(ffprobe failed)"
+
     warnings.append(
-        f"Mirage download (pre-FINALIZE): iOS tag "
-        f"primaries=bt709 transfer=bt709 matrix=bt709 "
-        f"{src_w}x{src_h}"
+        f"Mirage download (pre-FINALIZE): {cap_info}"
+    )
+    warnings.append(
+        f"Source HLG (native): {src_info}"
     )
     warnings.append(
         f"Upscaling {src_w}x{src_h} -> {output_width}x{output_height} "
@@ -407,6 +460,14 @@ def overlay_captions_on_hlg(
         # Build clean SDR reference (same content as what was sent to Mirage)
         ref_path = _build_clean_sdr_reference(
             source_hlg, duration, src_w, src_h, tmp_dir
+        )
+        # Probe the clean SDR reference as well
+        try:
+            ref_info = get_video_color_info(ref_path)
+        except FFmpegError:
+            ref_info = "(ffprobe failed)"
+        warnings.append(
+            f"Clean SDR reference: {ref_info}"
         )
         warnings.append(
             f"Applying post-Mirage SDR correction during FINALIZE: "
